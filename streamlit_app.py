@@ -215,6 +215,39 @@ st.header("🔔 Slack Reminders Configuration")
 
 slack_config = load_config()
 
+st.subheader("Reminder Thresholds")
+
+col1, col2, col3, col4 = st.columns(4)
+with col4:
+    exclude_drafts = st.checkbox(
+        "Exclude all draft PR reminders",
+        value=slack_config.get("exclude_drafts", True),
+        help="When checked, draft PRs are excluded from all reminders",
+        key="exclude_drafts_check"
+    )
+with col1:
+    hours_last_activity = st.number_input(
+        "Last activity (hours)",
+        min_value=1, max_value=168, value=slack_config.get("hours_last_activity", 24),
+        help="Remind if no activity for this many hours",
+        key="hours_last_activity"
+    )
+with col2:
+    days_draft_stale = st.number_input(
+        "Draft stale (days)",
+        min_value=1, max_value=30, value=slack_config.get("days_draft_stale", 7),
+        help="Remind if PR is draft for this many days",
+        key="days_draft_stale",
+        disabled=exclude_drafts
+    )
+with col3:
+    days_approved_not_merged = st.number_input(
+        "Approved not merged (days)",
+        min_value=1, max_value=14, value=slack_config.get("days_approved_not_merged", 1),
+        help="Remind if approved but not merged after this many days",
+        key="days_approved_not_merged"
+    )
+
 with st.expander("Configure Slack Integration", expanded=False):
     st.markdown("""
     **Setup Steps:**
@@ -229,12 +262,6 @@ with st.expander("Configure Slack Integration", expanded=False):
         value=slack_config.get("slack_bot_token", ""),
         type="password",
         help="Starts with xoxb-"
-    )
-    
-    days_inactive = st.number_input(
-        "Days of inactivity threshold",
-        min_value=1, max_value=30, value=slack_config.get("days_inactive", 7),
-        help="PRs with no activity for this many days will be flagged"
     )
     
     st.subheader("GitHub → Slack User Mapping")
@@ -259,7 +286,10 @@ with st.expander("Configure Slack Integration", expanded=False):
             "orgs": all_orgs,
             "usernames": all_usernames,
             "user_slack_mapping": new_mapping,
-            "days_inactive": days_inactive
+            "hours_last_activity": hours_last_activity,
+            "days_draft_stale": days_draft_stale,
+            "days_approved_not_merged": days_approved_not_merged,
+            "exclude_drafts": exclude_drafts
         }
         save_config(new_config)
         st.success("Configuration saved!")
@@ -269,10 +299,17 @@ with st.expander("Preview & Send Reminders", expanded=False):
     
     col1, col2 = st.columns(2)
     
+    reminder_config = {
+        "hours_last_activity": hours_last_activity,
+        "days_draft_stale": days_draft_stale,
+        "days_approved_not_merged": days_approved_not_merged,
+        "exclude_drafts": exclude_drafts
+    }
+    
     with col1:
         if st.button("👁️ Preview Messages (Dry Run)"):
             with st.spinner("Analyzing PRs..."):
-                results = send_reminders(all_orgs, selected_users, slack_config.get("days_inactive", 7), dry_run=True)
+                results = send_reminders(all_orgs, selected_users, reminder_config, dry_run=True)
             
             for r in results:
                 if r["status"] == "no_prs":
@@ -290,7 +327,7 @@ with st.expander("Preview & Send Reminders", expanded=False):
                 st.error("Please configure a valid Slack Bot Token first!")
             else:
                 with st.spinner("Sending Slack DMs..."):
-                    results = send_reminders(all_orgs, selected_users, slack_config.get("days_inactive", 7), dry_run=False)
+                    results = send_reminders(all_orgs, selected_users, reminder_config, dry_run=False)
                 
                 sent = sum(1 for r in results if r["status"] == "sent")
                 failed = sum(1 for r in results if r["status"] == "failed")

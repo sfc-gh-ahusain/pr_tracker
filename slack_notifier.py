@@ -63,12 +63,14 @@ def send_slack_dm(slack_user_id: str, message: str) -> bool:
     
     return True
 
-def find_stale_prs(orgs: list, username: str, days_inactive: int = 7) -> list:
+def find_stale_prs(orgs: list, username: str, hours_inactive: int = 24, exclude_drafts: bool = True) -> list:
     prs = search_prs(orgs, [username], state="open", days_back=90)
     stale = []
     now = datetime.utcnow()
     
     for pr in prs:
+        if exclude_drafts and pr.get("draft", False):
+            continue
         owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
         pr_number = pr.get("number")
         
@@ -78,22 +80,45 @@ def find_stale_prs(orgs: list, username: str, days_inactive: int = 7) -> list:
         created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")).replace(tzinfo=None)
         last_activity = last_comment.replace(tzinfo=None) if last_comment else created_at
         
-        days_since_activity = (now - last_activity).days
+        hours_since_activity = (now - last_activity).total_seconds() / 3600
         
-        if days_since_activity >= days_inactive:
+        if hours_since_activity >= hours_inactive:
             stale.append({
                 "pr": pr,
-                "days_inactive": days_since_activity,
+                "hours_inactive": int(hours_since_activity),
                 "reason": "no_activity"
             })
     
     return stale
 
-def find_approved_not_merged(orgs: list, username: str) -> list:
+def find_stale_drafts(orgs: list, username: str, days_draft_stale: int = 7) -> list:
+    prs = search_prs(orgs, [username], state="open", days_back=90)
+    stale_drafts = []
+    now = datetime.utcnow()
+    
+    for pr in prs:
+        if not pr.get("draft", False):
+            continue
+        
+        created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+        days_as_draft = (now - created_at).days
+        
+        if days_as_draft >= days_draft_stale:
+            stale_drafts.append({
+                "pr": pr,
+                "days_as_draft": days_as_draft,
+                "reason": "stale_draft"
+            })
+    
+    return stale_drafts
+
+def find_approved_not_merged(orgs: list, username: str, days_threshold: int = 1, exclude_drafts: bool = True) -> list:
     prs = search_prs(orgs, [username], state="open", days_back=90)
     approved_pending = []
     
     for pr in prs:
+        if exclude_drafts and pr.get("draft", False):
+            continue
         owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
         pr_number = pr.get("number")
         
@@ -102,44 +127,63 @@ def find_approved_not_merged(orgs: list, username: str) -> list:
         
         if first_approval:
             days_since_approval = (datetime.utcnow() - first_approval.replace(tzinfo=None)).days
-            approved_pending.append({
-                "pr": pr,
-                "days_since_approval": days_since_approval,
-                "reason": "approved_not_merged"
-            })
+            if days_since_approval >= days_threshold:
+                approved_pending.append({
+                    "pr": pr,
+                    "days_since_approval": days_since_approval,
+                    "reason": "approved_not_merged"
+                })
     
     return approved_pending
 
-def format_reminder_message(username: str, stale_prs: list, approved_prs: list) -> str:
-    if not stale_prs and not approved_prs:
+def format_reminder_message(username: str, stale_prs: list, approved_prs: list, stale_drafts: list) -> str:
+    total = len(stale_prs) + len(approved_prs) + len(stale_drafts)
+    if total == 0:
         return ""
     
-    lines = [f"*Weekly PR Reminder* - {datetime.now().strftime('%b %d, %Y')}\n"]
-    lines.append(f"Hi! You have *{len(stale_prs) + len(approved_prs)}* PR(s) that need attention:\n")
+    lines = [f"*PR Reminder* - {datetime.now().strftime('%b %d, %Y')}\n"]
+    lines.append(f"Hi! You have *{total}* PR(s) that need attention:\n")
     
     if stale_prs:
-        lines.append("*No Activity:*")
+        lines.append("*⏰ No Recent Activity:*")
         for item in stale_prs:
             pr = item["pr"]
-            lines.append(f"  • <{pr['html_url']}|PR #{pr['number']}>: \"{pr['title'][:50]}\" - No activity for {item['days_inactive']} days")
+            hours = item["hours_inactive"]
+            time_str = f"{hours // 24}d {hours % 24}h" if hours >= 24 else f"{hours}h"
+            lines.append(f"  • <{pr['html_url']}|PR #{pr['number']}>: \"{pr['title'][:50]}\" - Inactive for {time_str}")
+    
+    if stale_drafts:
+        lines.append("\n*📝 Stale Drafts:*")
+        for item in stale_drafts:
+            pr = item["pr"]
+            lines.append(f"  • <{pr['html_url']}|PR #{pr['number']}>: \"{pr['title'][:50]}\" - Draft for {item['days_as_draft']} days")
     
     if approved_prs:
-        lines.append("\n*Approved - Awaiting Merge:*")
+        lines.append("\n*✅ Approved - Awaiting Merge:*")
         for item in approved_prs:
             pr = item["pr"]
             lines.append(f"  • <{pr['html_url']}|PR #{pr['number']}>: \"{pr['title'][:50]}\" - Approved {item['days_since_approval']} days ago")
     
     return "\n".join(lines)
 
-def send_reminders(orgs: list, usernames: list, days_inactive: int = 7, dry_run: bool = False):
+def send_reminders(orgs: list, usernames: list, config: dict = None, dry_run: bool = False):
+    if config is None:
+        config = load_config()
+    
+    hours_last_activity = config.get("hours_last_activity", 24)
+    days_draft_stale = config.get("days_draft_stale", 7)
+    days_approved_not_merged = config.get("days_approved_not_merged", 1)
+    exclude_drafts = config.get("exclude_drafts", True)
+    
     user_slack_map = get_user_slack_mapping()
     results = []
     
     for username in usernames:
-        stale = find_stale_prs(orgs, username, days_inactive)
-        approved = find_approved_not_merged(orgs, username)
+        stale = find_stale_prs(orgs, username, hours_last_activity, exclude_drafts)
+        stale_drafts = [] if exclude_drafts else find_stale_drafts(orgs, username, days_draft_stale)
+        approved = find_approved_not_merged(orgs, username, days_approved_not_merged, exclude_drafts)
         
-        message = format_reminder_message(username, stale, approved)
+        message = format_reminder_message(username, stale, approved, stale_drafts)
         
         if not message:
             results.append({"user": username, "status": "no_prs", "message": ""})
@@ -168,7 +212,6 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Send PR reminder Slack DMs")
     parser.add_argument("--dry-run", action="store_true", help="Preview messages without sending")
-    parser.add_argument("--days", type=int, default=7, help="Days of inactivity threshold")
     args = parser.parse_args()
     
     config = load_config()
@@ -180,9 +223,10 @@ if __name__ == "__main__":
     ])
     
     print(f"Running PR reminder ({'DRY RUN' if args.dry_run else 'LIVE'})...")
-    print(f"Checking {len(usernames)} users for PRs inactive >= {args.days} days\n")
+    print(f"Checking {len(usernames)} users")
+    print(f"Config: {json.dumps({k: v for k, v in config.items() if k != 'slack_bot_token'}, indent=2)}\n")
     
-    results = send_reminders(orgs, usernames, args.days, dry_run=args.dry_run)
+    results = send_reminders(orgs, usernames, config, dry_run=args.dry_run)
     
     print(f"\n--- Summary ---")
     for r in results:

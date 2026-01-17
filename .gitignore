@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.streamlit/secrets.toml
+slack_config.json
