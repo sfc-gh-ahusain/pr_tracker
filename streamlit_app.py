@@ -1,10 +1,15 @@
 import streamlit as st
 import pandas as pd
+import json
+import os
 from datetime import datetime
 from github_api import (
     search_prs, get_pr_details, get_pr_reviews, get_pr_comments,
     parse_repo_from_url, get_first_approval_time, get_last_comment_time
 )
+from slack_notifier import load_config, save_config, send_reminders
+
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), "slack_config.json")
 
 st.set_page_config(page_title="PR Activity Tracker", page_icon="📊", layout="wide")
 st.title("📊 PR Activity Tracker")
@@ -204,3 +209,107 @@ else:
         with st.spinner("Fetching closed PRs..."):
             closed_prs = search_prs(all_orgs, selected_users, state="closed", days_back=days_back)
         display_closed_prs(closed_prs)
+
+st.divider()
+st.header("🔔 Slack Reminders Configuration")
+
+slack_config = load_config()
+
+with st.expander("Configure Slack Integration", expanded=False):
+    st.markdown("""
+    **Setup Steps:**
+    1. Create a Slack App at https://api.slack.com/apps
+    2. Add Bot Token Scopes: `chat:write`, `users:read`, `im:write`
+    3. Install to workspace and copy the Bot Token
+    4. Get each user's Slack Member ID (Profile → More → Copy member ID)
+    """)
+    
+    new_token = st.text_input(
+        "Slack Bot Token",
+        value=slack_config.get("slack_bot_token", ""),
+        type="password",
+        help="Starts with xoxb-"
+    )
+    
+    days_inactive = st.number_input(
+        "Days of inactivity threshold",
+        min_value=1, max_value=30, value=slack_config.get("days_inactive", 7),
+        help="PRs with no activity for this many days will be flagged"
+    )
+    
+    st.subheader("GitHub → Slack User Mapping")
+    st.caption("Enter Slack Member ID for each GitHub user")
+    
+    user_mapping = slack_config.get("user_slack_mapping", {})
+    new_mapping = {}
+    
+    cols = st.columns(2)
+    for i, username in enumerate(all_usernames):
+        with cols[i % 2]:
+            new_mapping[username] = st.text_input(
+                f"{username}",
+                value=user_mapping.get(username, ""),
+                key=f"slack_{username}",
+                placeholder="U0123456789"
+            )
+    
+    if st.button("💾 Save Slack Configuration"):
+        new_config = {
+            "slack_bot_token": new_token,
+            "orgs": all_orgs,
+            "usernames": all_usernames,
+            "user_slack_mapping": new_mapping,
+            "days_inactive": days_inactive
+        }
+        save_config(new_config)
+        st.success("Configuration saved!")
+
+with st.expander("Preview & Send Reminders", expanded=False):
+    st.caption("Preview what messages would be sent before actually sending them")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("👁️ Preview Messages (Dry Run)"):
+            with st.spinner("Analyzing PRs..."):
+                results = send_reminders(all_orgs, selected_users, slack_config.get("days_inactive", 7), dry_run=True)
+            
+            for r in results:
+                if r["status"] == "no_prs":
+                    st.info(f"**{r['user']}**: No PRs need attention")
+                else:
+                    with st.container():
+                        slack_id = r.get("slack_id", "NOT MAPPED")
+                        st.markdown(f"**{r['user']}** (Slack: `{slack_id}`)")
+                        st.code(r["message"], language=None)
+    
+    with col2:
+        if st.button("🚀 Send Reminders NOW", type="primary"):
+            token = slack_config.get("slack_bot_token", "")
+            if not token or token == "xoxb-YOUR-BOT-TOKEN-HERE":
+                st.error("Please configure a valid Slack Bot Token first!")
+            else:
+                with st.spinner("Sending Slack DMs..."):
+                    results = send_reminders(all_orgs, selected_users, slack_config.get("days_inactive", 7), dry_run=False)
+                
+                sent = sum(1 for r in results if r["status"] == "sent")
+                failed = sum(1 for r in results if r["status"] == "failed")
+                no_slack = sum(1 for r in results if r["status"] == "no_slack_id")
+                
+                st.success(f"Sent: {sent} | Failed: {failed} | No Slack ID: {no_slack}")
+                
+                for r in results:
+                    if r["status"] == "sent":
+                        st.write(f"✅ {r['user']}")
+                    elif r["status"] == "failed":
+                        st.write(f"❌ {r['user']} - Failed to send")
+                    elif r["status"] == "no_slack_id":
+                        st.write(f"⚠️ {r['user']} - No Slack ID configured")
+
+st.divider()
+st.caption("""
+**Automated Monday Reminders:** Run `crontab -e` and add:
+```
+0 9 * * 1 cd /Users/ahusain/pr-dashboard && ./venv/bin/python slack_notifier.py
+```
+""")
