@@ -2,7 +2,7 @@ import os
 import json
 import requests
 from datetime import datetime, timedelta
-from github_api import search_prs, get_pr_reviews, get_pr_comments, parse_repo_from_url, get_first_approval_time, get_last_comment_time
+from github_api import search_prs, get_pr_reviews, get_pr_comments, get_pr_details, parse_repo_from_url, get_first_approval_time, get_last_comment_time
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "slack_config.json")
 
@@ -23,6 +23,10 @@ def get_slack_token():
 def get_user_slack_mapping():
     config = load_config()
     return config.get("user_slack_mapping", {})
+
+def get_user_display_names():
+    config = load_config()
+    return config.get("user_display_names", {})
 
 def send_slack_dm(slack_user_id: str, message: str) -> bool:
     token = get_slack_token()
@@ -83,10 +87,13 @@ def find_stale_prs(orgs: list, username: str, hours_inactive: int = 24, exclude_
         hours_since_activity = (now - last_activity).total_seconds() / 3600
         
         if hours_since_activity >= hours_inactive:
+            details = get_pr_details(owner, repo, pr_number) if owner and repo else None
+            base_branch = details.get("base", {}).get("ref", "") if details else ""
             stale.append({
                 "pr": pr,
                 "hours_inactive": int(hours_since_activity),
-                "reason": "no_activity"
+                "reason": "no_activity",
+                "base_branch": base_branch
             })
     
     return stale
@@ -104,10 +111,15 @@ def find_stale_drafts(orgs: list, username: str, days_draft_stale: int = 7) -> l
         days_as_draft = (now - created_at).days
         
         if days_as_draft >= days_draft_stale:
+            owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+            pr_number = pr.get("number")
+            details = get_pr_details(owner, repo, pr_number) if owner and repo else None
+            base_branch = details.get("base", {}).get("ref", "") if details else ""
             stale_drafts.append({
                 "pr": pr,
                 "days_as_draft": days_as_draft,
-                "reason": "stale_draft"
+                "reason": "stale_draft",
+                "base_branch": base_branch
             })
     
     return stale_drafts
@@ -128,41 +140,57 @@ def find_approved_not_merged(orgs: list, username: str, days_threshold: int = 1,
         if first_approval:
             days_since_approval = (datetime.utcnow() - first_approval.replace(tzinfo=None)).days
             if days_since_approval >= days_threshold:
+                details = get_pr_details(owner, repo, pr_number) if owner and repo else None
+                base_branch = details.get("base", {}).get("ref", "") if details else ""
                 approved_pending.append({
                     "pr": pr,
                     "days_since_approval": days_since_approval,
-                    "reason": "approved_not_merged"
+                    "reason": "approved_not_merged",
+                    "base_branch": base_branch
                 })
     
     return approved_pending
 
-def format_reminder_message(username: str, stale_prs: list, approved_prs: list, stale_drafts: list) -> str:
+def format_reminder_message(username: str, stale_prs: list, approved_prs: list, stale_drafts: list, display_name: str = None) -> str:
     total = len(stale_prs) + len(approved_prs) + len(stale_drafts)
     if total == 0:
         return ""
     
+    greeting_name = display_name.split()[0] if display_name else "there"
     lines = [f"*PR Reminder* - {datetime.now().strftime('%b %d, %Y')}\n"]
-    lines.append(f"Hi! You have *{total}* PR(s) that need attention:\n")
+    lines.append(f"Hi {greeting_name}! You have *{total}* PR(s) that need attention:\n")
     
     if stale_prs:
         lines.append("*⏰ No Recent Activity:*")
         for item in stale_prs:
             pr = item["pr"]
             hours = item["hours_inactive"]
+            base = item.get("base_branch", "")
+            base_str = f" → `{base}`" if base else ""
             time_str = f"{hours // 24}d {hours % 24}h" if hours >= 24 else f"{hours}h"
-            lines.append(f"  • <{pr['html_url']}|PR #{pr['number']}>: \"{pr['title'][:50]}\" - Inactive for {time_str}")
+            lines.append(f"  • <{pr['html_url']}|PR #{pr['number']}>{base_str}: \"{pr['title'][:50]}\" - Inactive for {time_str}")
     
     if stale_drafts:
         lines.append("\n*📝 Stale Drafts:*")
         for item in stale_drafts:
             pr = item["pr"]
-            lines.append(f"  • <{pr['html_url']}|PR #{pr['number']}>: \"{pr['title'][:50]}\" - Draft for {item['days_as_draft']} days")
+            base = item.get("base_branch", "")
+            base_str = f" → `{base}`" if base else ""
+            lines.append(f"  • <{pr['html_url']}|PR #{pr['number']}>{base_str}: \"{pr['title'][:50]}\" - Draft for {item['days_as_draft']} days")
     
     if approved_prs:
         lines.append("\n*✅ Approved - Awaiting Merge:*")
         for item in approved_prs:
             pr = item["pr"]
-            lines.append(f"  • <{pr['html_url']}|PR #{pr['number']}>: \"{pr['title'][:50]}\" - Approved {item['days_since_approval']} days ago")
+            base = item.get("base_branch", "")
+            base_str = f" → `{base}`" if base else ""
+            lines.append(f"  • <{pr['html_url']}|PR #{pr['number']}>{base_str}: \"{pr['title'][:50]}\" - Approved {item['days_since_approval']} days ago")
+    
+    lines.append("\n---")
+    lines.append("Please take a moment to review these PRs. If any are stalled, I'd like to understand the blockers so I can help move them forward. Is the inactivity due to:")
+    lines.append("a) Pending reviews (stakeholders or area-experts)?")
+    lines.append("b) Technical hurdles or shifting priorities?")
+    lines.append("\nLet me know where I can step in to clear the path or nudge the right/concerned folks.")
     
     return "\n".join(lines)
 
@@ -176,6 +204,7 @@ def send_reminders(orgs: list, usernames: list, config: dict = None, dry_run: bo
     exclude_drafts = config.get("exclude_drafts", True)
     
     user_slack_map = get_user_slack_mapping()
+    user_display_names = get_user_display_names()
     results = []
     
     for username in usernames:
@@ -183,7 +212,8 @@ def send_reminders(orgs: list, usernames: list, config: dict = None, dry_run: bo
         stale_drafts = [] if exclude_drafts else find_stale_drafts(orgs, username, days_draft_stale)
         approved = find_approved_not_merged(orgs, username, days_approved_not_merged, exclude_drafts)
         
-        message = format_reminder_message(username, stale, approved, stale_drafts)
+        display_name = user_display_names.get(username)
+        message = format_reminder_message(username, stale, approved, stale_drafts, display_name)
         
         if not message:
             results.append({"user": username, "status": "no_prs", "message": ""})

@@ -21,18 +21,31 @@ DEFAULT_USERNAMES = [
     "sfc-gh-jshim", "sfc-gh-nwijetunga", "sfc-gh-hoyang"
 ]
 
+saved_config = load_config()
+saved_orgs = saved_config.get("orgs", DEFAULT_ORGS)
+saved_usernames = saved_config.get("usernames", DEFAULT_USERNAMES)
+
 with st.sidebar:
     st.header("⚙️ Configuration")
     
-    orgs_input = st.text_area("GitHub Organizations (one per line)", value="\n".join(DEFAULT_ORGS))
+    orgs_input = st.text_area("GitHub Organizations (one per line)", value="\n".join(saved_orgs))
     all_orgs = [o.strip() for o in orgs_input.strip().split("\n") if o.strip()]
     
     usernames_input = st.text_area(
-        "Direct Reports GitHub Usernames (one per line)",
-        value="\n".join(DEFAULT_USERNAMES),
+        "Participants List (GitHub usernames, one per line)",
+        value="\n".join(saved_usernames),
         help="Update these to your team's actual GitHub usernames"
     )
     all_usernames = [u.strip() for u in usernames_input.strip().split("\n") if u.strip()]
+    
+    if st.button("💾 Save Participants"):
+        saved_config.update({
+            "orgs": all_orgs,
+            "usernames": all_usernames
+        })
+        save_config(saved_config)
+        st.success("Participants saved!")
+        st.rerun()
     
     st.divider()
     st.subheader("🎯 Filters")
@@ -64,6 +77,12 @@ with st.sidebar:
     
     days_back = st.slider("Days to look back", 7, 365, 90)
     
+    exclude_cherrypicks = st.checkbox(
+        "Exclude Cherry-Pick PRs",
+        value=True,
+        help="Filter out PRs with 'cherry-pick', 'cherrypick', or 'cp-' in the title"
+    )
+    
     if st.button("🔄 Refresh Data", type="primary"):
         st.cache_data.clear()
 
@@ -73,35 +92,61 @@ if not all_orgs or not selected_users:
 
 st.caption(f"Showing **{len(selected_users)}** team member(s) | **{pr_state}** PRs | Last **{days_back}** days")
 
-def display_open_prs(prs):
+def is_cherrypick_pr(title: str) -> bool:
+    title_lower = title.lower()
+    return any(pattern in title_lower for pattern in ['cherry-pick', 'cherrypick', 'cherry pick', '[cp]', '(cp)'])
+
+def display_open_prs(prs, exclude_cherrypicks=False):
+    if exclude_cherrypicks:
+        prs = [pr for pr in prs if not is_cherrypick_pr(pr.get("title", ""))]
+    
     if not prs:
         st.info("No open PRs found.")
         return
     
     rows = []
     progress = st.progress(0)
+    now = datetime.utcnow()
+    
     for i, pr in enumerate(prs):
         owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
         pr_number = pr.get("number")
         
         reviews = get_pr_reviews(owner, repo, pr_number) if owner and repo else []
         comments = get_pr_comments(owner, repo, pr_number) if owner and repo else []
+        details = get_pr_details(owner, repo, pr_number) if owner and repo else None
         first_approval = get_first_approval_time(reviews)
         last_comment = get_last_comment_time(comments)
+        base_branch = details.get("base", {}).get("ref", "—") if details else "—"
         created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
         
         is_draft = pr.get("draft", False)
+        
+        last_activity = last_comment if last_comment else created_at.replace(tzinfo=None)
+        if hasattr(last_activity, 'tzinfo') and last_activity.tzinfo:
+            last_activity = last_activity.replace(tzinfo=None)
+        hours_inactive = int((now - last_activity).total_seconds() / 3600)
+        
+        attention_reasons = []
+        if hours_inactive >= 24:
+            attention_reasons.append(f"⏰ {hours_inactive}h inactive")
+        if first_approval and (now - first_approval.replace(tzinfo=None)).days >= 1:
+            attention_reasons.append("✅ Approved, not merged")
+        if is_draft and (now - created_at.replace(tzinfo=None)).days >= 7:
+            attention_reasons.append("📝 Stale draft")
         
         rows.append({
             "Author": pr.get("user", {}).get("login", "Unknown"),
             "Repository": f"{owner}/{repo}",
             "PR #": pr_number,
             "Title": pr.get("title", ""),
-            "Draft": "📝 Draft" if is_draft else "",
+            "Base": base_branch,
+            "Draft": "📝" if is_draft else "",
             "Submit Time": created_at.strftime("%Y-%m-%d %H:%M"),
             "Last Comment": last_comment.strftime("%Y-%m-%d %H:%M") if last_comment else "—",
             "First Approval": first_approval.strftime("%Y-%m-%d %H:%M") if first_approval else "—",
-            "Age (days)": (datetime.utcnow() - created_at.replace(tzinfo=None)).days,
+            "Age (days)": (now - created_at.replace(tzinfo=None)).days,
+            "Needs Attention": " | ".join(attention_reasons) if attention_reasons else "",
             "URL": pr.get("html_url", "")
         })
         progress.progress((i + 1) / len(prs))
@@ -109,9 +154,10 @@ def display_open_prs(prs):
     progress.empty()
     df = pd.DataFrame(rows)
     
+    needs_attention_count = len(df[df["Needs Attention"] != ""])
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Open PRs", len(df))
-    col2.metric("Drafts", len(df[df["Draft"] != ""]))
+    col2.metric("Needs Attention", needs_attention_count)
     col3.metric("Awaiting Approval", len(df[df["First Approval"] == "—"]))
     col4.metric("Avg Age (days)", f"{df['Age (days)'].mean():.1f}" if len(df) > 0 else "—")
     
@@ -139,6 +185,7 @@ def display_closed_prs(prs):
         details = get_pr_details(owner, repo, pr_number) if owner and repo else None
         additions = details.get("additions", 0) if details else 0
         deletions = details.get("deletions", 0) if details else 0
+        base_branch = details.get("base", {}).get("ref", "—") if details else "—"
         created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
         closed_at = datetime.fromisoformat(pr["closed_at"].replace("Z", "+00:00")) if pr.get("closed_at") else None
         
@@ -147,6 +194,7 @@ def display_closed_prs(prs):
             "Repository": f"{owner}/{repo}",
             "PR #": pr_number,
             "Title": pr.get("title", ""),
+            "Base": base_branch,
             "Merged": "✅" if (details and details.get("merged")) else "❌",
             "Created": created_at.strftime("%Y-%m-%d"),
             "Closed": closed_at.strftime("%Y-%m-%d") if closed_at else "—",
@@ -189,7 +237,7 @@ if pr_state == "Open":
     st.subheader("🟢 Open Pull Requests")
     with st.spinner("Fetching open PRs..."):
         open_prs = search_prs(all_orgs, selected_users, state="open", days_back=days_back)
-    display_open_prs(open_prs)
+    display_open_prs(open_prs, exclude_cherrypicks)
 
 elif pr_state == "Closed":
     st.subheader("🔴 Closed Pull Requests")
@@ -203,7 +251,7 @@ else:
     with tab_open:
         with st.spinner("Fetching open PRs..."):
             open_prs = search_prs(all_orgs, selected_users, state="open", days_back=days_back)
-        display_open_prs(open_prs)
+        display_open_prs(open_prs, exclude_cherrypicks)
     
     with tab_closed:
         with st.spinner("Fetching closed PRs..."):
@@ -264,28 +312,85 @@ with st.expander("Configure Slack Integration", expanded=False):
         help="Starts with xoxb-"
     )
     
+    my_slack_id = st.text_input(
+        "My Slack ID (for CC myself)",
+        value=slack_config.get("my_slack_id", ""),
+        help="Your own Slack Member ID to receive copies of sent messages",
+        placeholder="U0123456789"
+    )
+    
     st.subheader("GitHub → Slack User Mapping")
-    st.caption("Enter Slack Member ID for each GitHub user")
+    st.caption("Enter Display Name and Slack Member ID for each GitHub user")
     
     user_mapping = slack_config.get("user_slack_mapping", {})
+    user_names = slack_config.get("user_display_names", {})
     new_mapping = {}
+    new_names = {}
     
-    cols = st.columns(2)
-    for i, username in enumerate(all_usernames):
-        with cols[i % 2]:
+    for username in all_usernames:
+        col_gh, col_name, col_id = st.columns([2, 2, 2])
+        with col_gh:
+            st.text_input("GitHub", value=username, disabled=True, key=f"gh_{username}")
+        with col_name:
+            new_names[username] = st.text_input(
+                "Display Name",
+                value=user_names.get(username, ""),
+                key=f"name_{username}",
+                placeholder="First Last"
+            )
+        with col_id:
             new_mapping[username] = st.text_input(
-                f"{username}",
+                "Slack ID",
                 value=user_mapping.get(username, ""),
                 key=f"slack_{username}",
                 placeholder="U0123456789"
             )
     
+    st.subheader("Additional Slack Contacts (CC only)")
+    st.caption("Add people without GitHub accounts who can be CC'd on messages")
+    
+    additional_contacts = slack_config.get("additional_slack_contacts", {})
+    
+    if "new_contacts" not in st.session_state:
+        st.session_state.new_contacts = dict(additional_contacts)
+    
+    col_name, col_id, col_add = st.columns([2, 2, 1])
+    with col_name:
+        new_contact_name = st.text_input("Name", key="new_contact_name", placeholder="John Doe")
+    with col_id:
+        new_contact_id = st.text_input("Slack ID", key="new_contact_id", placeholder="U0123456789")
+    with col_add:
+        st.write("")  # spacing
+        if st.button("➕ Add", key="add_contact_btn"):
+            if new_contact_name and new_contact_id:
+                st.session_state.new_contacts[new_contact_name] = new_contact_id
+                st.rerun()
+    
+    if st.session_state.new_contacts:
+        st.write("**Current additional contacts:**")
+        contacts_to_remove = []
+        for name, slack_id in st.session_state.new_contacts.items():
+            col1, col2, col3 = st.columns([2, 2, 1])
+            with col1:
+                st.text(name)
+            with col2:
+                st.text(slack_id)
+            with col3:
+                if st.button("🗑️", key=f"remove_{name}"):
+                    contacts_to_remove.append(name)
+        for name in contacts_to_remove:
+            del st.session_state.new_contacts[name]
+            st.rerun()
+    
     if st.button("💾 Save Slack Configuration"):
         new_config = {
             "slack_bot_token": new_token,
+            "my_slack_id": my_slack_id,
             "orgs": all_orgs,
             "usernames": all_usernames,
             "user_slack_mapping": new_mapping,
+            "user_display_names": new_names,
+            "additional_slack_contacts": st.session_state.new_contacts,
             "hours_last_activity": hours_last_activity,
             "days_draft_stale": days_draft_stale,
             "days_approved_not_merged": days_approved_not_merged,
@@ -295,9 +400,37 @@ with st.expander("Configure Slack Integration", expanded=False):
         st.success("Configuration saved!")
 
 with st.expander("Preview & Send Reminders", expanded=False):
-    st.caption("Preview what messages would be sent before actually sending them")
+    st.caption("Preview what messages would be sent, edit if needed, then send")
     
-    col1, col2 = st.columns(2)
+    github_slack_users = {k: v for k, v in slack_config.get("user_slack_mapping", {}).items() if v}
+    user_display_names = slack_config.get("user_display_names", {})
+    additional_contacts = st.session_state.get("new_contacts", slack_config.get("additional_slack_contacts", {}))
+    
+    cc_options_map = {}
+    for gh_user, slack_id in github_slack_users.items():
+        display = user_display_names.get(gh_user) or gh_user
+        cc_options_map[display] = {"type": "github", "github": gh_user, "slack_id": slack_id}
+    for name, slack_id in additional_contacts.items():
+        cc_options_map[f"📋 {name}"] = {"type": "additional", "slack_id": slack_id}
+    
+    all_cc_options = list(cc_options_map.keys())
+    col_cc, col_myself = st.columns([3, 1])
+    with col_cc:
+        cc_recipients = st.multiselect(
+            "CC additional recipients",
+            options=all_cc_options,
+            default=[],
+            help="These people will receive a copy of all messages sent",
+            key="cc_recipients"
+        )
+    with col_myself:
+        my_slack_id_configured = slack_config.get("my_slack_id", "")
+        cc_myself = st.checkbox(
+            "CC myself",
+            value=False,
+            disabled=not my_slack_id_configured,
+            help="Send a copy to yourself" if my_slack_id_configured else "Configure 'My Slack ID' in Slack Integration first"
+        )
     
     reminder_config = {
         "hours_last_activity": hours_last_activity,
@@ -306,42 +439,97 @@ with st.expander("Preview & Send Reminders", expanded=False):
         "exclude_drafts": exclude_drafts
     }
     
-    with col1:
-        if st.button("👁️ Preview Messages (Dry Run)"):
-            with st.spinner("Analyzing PRs..."):
-                results = send_reminders(all_orgs, selected_users, reminder_config, dry_run=True)
-            
-            for r in results:
-                if r["status"] == "no_prs":
-                    st.info(f"**{r['user']}**: No PRs need attention")
-                else:
-                    with st.container():
-                        slack_id = r.get("slack_id", "NOT MAPPED")
-                        st.markdown(f"**{r['user']}** (Slack: `{slack_id}`)")
-                        st.code(r["message"], language=None)
+    if "preview_messages" not in st.session_state:
+        st.session_state.preview_messages = {}
+    if "preview_users" not in st.session_state:
+        st.session_state.preview_users = []
     
-    with col2:
-        if st.button("🚀 Send Reminders NOW", type="primary"):
+    if set(st.session_state.preview_users) != set(selected_users):
+        st.session_state.preview_messages = {}
+        st.session_state.preview_users = selected_users.copy()
+    
+    if st.button("👁️ Generate Preview"):
+        with st.spinner("Analyzing PRs..."):
+            results = send_reminders(all_orgs, selected_users, reminder_config, dry_run=True)
+        st.session_state.preview_messages = {
+            r["user"]: {"message": r["message"], "slack_id": r.get("slack_id"), "status": r["status"]}
+            for r in results
+        }
+        st.session_state.preview_users = selected_users.copy()
+        st.rerun()
+    
+    edited_messages = {}
+    if st.session_state.preview_messages:
+        for user, data in st.session_state.preview_messages.items():
+            if data["status"] == "no_prs":
+                st.info(f"**{user}**: No PRs need attention")
+            else:
+                slack_id = data.get("slack_id", "NOT MAPPED")
+                st.markdown(f"**{user}** (Slack: `{slack_id}`)")
+                edited_messages[user] = st.text_area(
+                    f"Message for {user}",
+                    value=data["message"],
+                    height=250,
+                    key=f"msg_{user}",
+                    label_visibility="collapsed"
+                )
+        
+        if cc_recipients:
+            st.info(f"📋 CC: {', '.join(cc_recipients)}")
+        
+        st.divider()
+        if st.button("🚀 Send Edited Messages", type="primary"):
             token = slack_config.get("slack_bot_token", "")
             if not token or token == "xoxb-YOUR-BOT-TOKEN-HERE":
                 st.error("Please configure a valid Slack Bot Token first!")
             else:
-                with st.spinner("Sending Slack DMs..."):
-                    results = send_reminders(all_orgs, selected_users, reminder_config, dry_run=False)
+                from slack_notifier import send_slack_dm, get_user_slack_mapping
+                user_slack_map = get_user_slack_mapping()
                 
-                sent = sum(1 for r in results if r["status"] == "sent")
-                failed = sum(1 for r in results if r["status"] == "failed")
-                no_slack = sum(1 for r in results if r["status"] == "no_slack_id")
+                sent, failed, no_slack, cc_sent, cc_failed = 0, 0, 0, 0, 0
+                for user, message in edited_messages.items():
+                    if not message.strip():
+                        continue
+                    slack_id = user_slack_map.get(user)
+                    if not slack_id or slack_id == "U_SLACK_ID_HERE":
+                        st.write(f"⚠️ {user} - No Slack ID configured")
+                        no_slack += 1
+                        continue
+                    
+                    success = send_slack_dm(slack_id, message)
+                    if success:
+                        st.write(f"✅ {user}")
+                        sent += 1
+                    else:
+                        st.write(f"❌ {user} - Failed to send")
+                        failed += 1
+                    
+                    for cc_display_name in cc_recipients:
+                        cc_info = cc_options_map.get(cc_display_name, {})
+                        if cc_info.get("type") == "github" and cc_info.get("github") == user:
+                            continue
+                        cc_slack_id = cc_info.get("slack_id")
+                        if cc_slack_id:
+                            cc_message = f"📋 *CC - Message sent to {user}:*\n\n{message}"
+                            if send_slack_dm(cc_slack_id, cc_message):
+                                cc_sent += 1
+                            else:
+                                cc_failed += 1
                 
-                st.success(f"Sent: {sent} | Failed: {failed} | No Slack ID: {no_slack}")
+                if cc_myself and my_slack_id_configured:
+                    for user, message in edited_messages.items():
+                        if not message.strip():
+                            continue
+                        cc_message = f"📋 *CC - Message sent to {user}:*\n\n{message}"
+                        if send_slack_dm(my_slack_id_configured, cc_message):
+                            cc_sent += 1
+                        else:
+                            cc_failed += 1
                 
-                for r in results:
-                    if r["status"] == "sent":
-                        st.write(f"✅ {r['user']}")
-                    elif r["status"] == "failed":
-                        st.write(f"❌ {r['user']} - Failed to send")
-                    elif r["status"] == "no_slack_id":
-                        st.write(f"⚠️ {r['user']} - No Slack ID configured")
+                summary = f"Sent: {sent} | Failed: {failed} | No Slack ID: {no_slack}"
+                if cc_recipients or cc_myself:
+                    summary += f" | CC sent: {cc_sent} | CC failed: {cc_failed}"
+                st.success(summary)
 
 st.divider()
 st.caption("""
