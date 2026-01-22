@@ -432,7 +432,9 @@ with st.expander("Preview & Send Reminders", expanded=False):
         "days_draft_stale": days_draft_stale,
         "days_approved_not_merged": days_approved_not_merged,
         "exclude_drafts": exclude_drafts,
-        "days_back": days_back
+        "days_back": days_back,
+        "user_display_names": slack_config.get("user_display_names", {}),
+        "user_slack_mapping": slack_config.get("user_slack_mapping", {})
     }
     
     if "preview_messages" not in st.session_state:
@@ -445,6 +447,11 @@ with st.expander("Preview & Send Reminders", expanded=False):
         st.session_state.preview_users = selected_users.copy()
     
     if st.button("👁️ Generate Preview"):
+        fresh_config = load_config()
+        reminder_config.update({
+            "user_display_names": fresh_config.get("user_display_names", {}),
+            "user_slack_mapping": fresh_config.get("user_slack_mapping", {})
+        })
         with st.spinner("Analyzing PRs..."):
             results = send_reminders(all_repos, selected_users, reminder_config, dry_run=True)
         st.session_state.preview_messages = {

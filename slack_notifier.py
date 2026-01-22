@@ -222,8 +222,8 @@ def send_reminders(repos: list, usernames: list, config: dict = None, dry_run: b
     exclude_drafts = config.get("exclude_drafts", True)
     days_back = config.get("days_back", 90)
     
-    user_slack_map = get_user_slack_mapping()
-    user_display_names = get_user_display_names()
+    user_slack_map = config.get("user_slack_mapping") or get_user_slack_mapping()
+    user_display_names = config.get("user_display_names") or get_user_display_names()
     results = []
     
     for username in usernames:
