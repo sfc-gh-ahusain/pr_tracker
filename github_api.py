@@ -19,10 +19,10 @@ def get_headers():
     return headers
 
 @st.cache_data(ttl=3600)
-def search_prs(orgs: list[str], usernames: list[str], state: str = "open", days_back: int = 90) -> list[dict]:
+def search_prs(repos: list[str], usernames: list[str], state: str = "open", days_back: int = 90) -> list[dict]:
     prs = []
     since_date = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    orgs_lower = [o.lower() for o in orgs]
+    repos_lower = [r.lower() for r in repos]
     
     for username in usernames:
         query = f"is:pr author:{username} state:{state} created:>={since_date}"
@@ -35,8 +35,8 @@ def search_prs(orgs: list[str], usernames: list[str], state: str = "open", days_
             data = resp.json()
             for item in data.get("items", []):
                 repo_url = item.get("repository_url", "")
-                org = repo_url.split("/")[-2].lower() if "/repos/" in repo_url else ""
-                if org in orgs_lower:
+                repo_path = "/".join(repo_url.split("/")[-2:]).lower() if "/repos/" in repo_url else ""
+                if repo_path in repos_lower:
                     prs.append(item)
         except Exception as e:
             st.warning(f"Error fetching PRs for {username}: {e}")
@@ -73,6 +73,16 @@ def get_pr_comments(owner: str, repo: str, pr_number: int) -> list[dict]:
     except Exception:
         return []
 
+@st.cache_data(ttl=300)
+def get_pr_review_comments(owner: str, repo: str, pr_number: int) -> list[dict]:
+    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/comments"
+    try:
+        resp = requests.get(url, headers=get_headers(), timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return []
+
 def parse_repo_from_url(url: str) -> tuple[str, str]:
     parts = url.replace("https://github.com/", "").replace("https://api.github.com/repos/", "").split("/")
     if len(parts) >= 2:
@@ -88,6 +98,22 @@ def get_first_approval_time(reviews: list[dict]) -> Optional[datetime]:
 
 def get_last_comment_time(comments: list[dict]) -> Optional[datetime]:
     if comments:
-        comments.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-        return datetime.fromisoformat(comments[0]["created_at"].replace("Z", "+00:00"))
+        comments.sort(key=lambda x: x.get("updated_at", x.get("created_at", "")), reverse=True)
+        return datetime.fromisoformat(comments[0].get("updated_at", comments[0]["created_at"]).replace("Z", "+00:00"))
     return None
+
+def get_last_activity_time(issue_comments: list[dict], review_comments: list[dict], reviews: list[dict]) -> Optional[datetime]:
+    all_times = []
+    for c in issue_comments:
+        ts = c.get("updated_at") or c.get("created_at")
+        if ts:
+            all_times.append(datetime.fromisoformat(ts.replace("Z", "+00:00")))
+    for c in review_comments:
+        ts = c.get("updated_at") or c.get("created_at")
+        if ts:
+            all_times.append(datetime.fromisoformat(ts.replace("Z", "+00:00")))
+    for r in reviews:
+        ts = r.get("submitted_at")
+        if ts:
+            all_times.append(datetime.fromisoformat(ts.replace("Z", "+00:00")))
+    return max(all_times) if all_times else None

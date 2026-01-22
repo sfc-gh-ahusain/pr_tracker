@@ -4,32 +4,25 @@ import json
 import os
 from datetime import datetime
 from github_api import (
-    search_prs, get_pr_details, get_pr_reviews, get_pr_comments,
-    parse_repo_from_url, get_first_approval_time, get_last_comment_time
+    search_prs, get_pr_details, get_pr_reviews, get_pr_comments, get_pr_review_comments,
+    parse_repo_from_url, get_first_approval_time, get_last_comment_time, get_last_activity_time
 )
-from slack_notifier import load_config, save_config, send_reminders
+from slack_notifier import load_config, save_config, send_reminders, get_config_with_defaults
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "slack_config.json")
 
 st.set_page_config(page_title="PR Activity Tracker", page_icon="📊", layout="wide")
 st.title("📊 PR Activity Tracker")
 
-DEFAULT_ORGS = ["frostdb", "fdb-tls-tools", "snowflakedb"]
-DEFAULT_USERNAMES = [
-    "sfc-gh-alfeng", "sfc-gh-huliu", "sfc-gh-juliu", "sfc-gh-imubarek",
-    "sfc-gh-ynannapaneni", "sfc-gh-speddi", "sfc-gh-tpendock", "sfc-gh-bravi",
-    "sfc-gh-jshim", "sfc-gh-nwijetunga", "sfc-gh-hoyang"
-]
-
-saved_config = load_config()
-saved_orgs = saved_config.get("orgs", DEFAULT_ORGS)
-saved_usernames = saved_config.get("usernames", DEFAULT_USERNAMES)
+saved_config = get_config_with_defaults()
+saved_repos = saved_config.get("repos")
+saved_usernames = saved_config.get("usernames")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
     
-    orgs_input = st.text_area("GitHub Organizations (one per line)", value="\n".join(saved_orgs))
-    all_orgs = [o.strip() for o in orgs_input.strip().split("\n") if o.strip()]
+    repos_input = st.text_area("GitHub Repositories (one per line, e.g. snowflakedb/frostdb)", value="\n".join(saved_repos))
+    all_repos = [r.strip() for r in repos_input.strip().split("\n") if r.strip()]
     
     usernames_input = st.text_area(
         "Participants List (GitHub usernames, one per line)",
@@ -38,13 +31,14 @@ with st.sidebar:
     )
     all_usernames = [u.strip() for u in usernames_input.strip().split("\n") if u.strip()]
     
-    if st.button("💾 Save Participants"):
-        saved_config.update({
-            "orgs": all_orgs,
+    if st.button("💾 Save Config"):
+        current_config = load_config()
+        current_config.update({
+            "repos": all_repos,
             "usernames": all_usernames
         })
-        save_config(saved_config)
-        st.success("Participants saved!")
+        save_config(current_config)
+        st.success("Configuration saved!")
         st.rerun()
     
     st.divider()
@@ -86,8 +80,8 @@ with st.sidebar:
     if st.button("🔄 Refresh Data", type="primary"):
         st.cache_data.clear()
 
-if not all_orgs or not selected_users:
-    st.warning("Please configure organizations and select at least one user.")
+if not all_repos or not selected_users:
+    st.warning("Please configure repositories and select at least one user.")
     st.stop()
 
 st.caption(f"Showing **{len(selected_users)}** team member(s) | **{pr_state}** PRs | Last **{days_back}** days")
@@ -113,19 +107,18 @@ def display_open_prs(prs, exclude_cherrypicks=False):
         pr_number = pr.get("number")
         
         reviews = get_pr_reviews(owner, repo, pr_number) if owner and repo else []
-        comments = get_pr_comments(owner, repo, pr_number) if owner and repo else []
+        issue_comments = get_pr_comments(owner, repo, pr_number) if owner and repo else []
+        review_comments = get_pr_review_comments(owner, repo, pr_number) if owner and repo else []
         details = get_pr_details(owner, repo, pr_number) if owner and repo else None
         first_approval = get_first_approval_time(reviews)
-        last_comment = get_last_comment_time(comments)
+        last_activity = get_last_activity_time(issue_comments, review_comments, reviews)
         base_branch = details.get("base", {}).get("ref", "—") if details else "—"
         created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
         
         is_draft = pr.get("draft", False)
         
-        last_activity = last_comment if last_comment else created_at.replace(tzinfo=None)
-        if hasattr(last_activity, 'tzinfo') and last_activity.tzinfo:
-            last_activity = last_activity.replace(tzinfo=None)
-        hours_inactive = int((now - last_activity).total_seconds() / 3600)
+        last_activity_dt = last_activity.replace(tzinfo=None) if last_activity else created_at.replace(tzinfo=None)
+        hours_inactive = int((now - last_activity_dt).total_seconds() / 3600)
         
         attention_reasons = []
         if hours_inactive >= 24:
@@ -143,7 +136,7 @@ def display_open_prs(prs, exclude_cherrypicks=False):
             "Base": base_branch,
             "Draft": "📝" if is_draft else "",
             "Submit Time": created_at.strftime("%Y-%m-%d %H:%M"),
-            "Last Comment": last_comment.strftime("%Y-%m-%d %H:%M") if last_comment else "—",
+            "Last Activity": last_activity_dt.strftime("%Y-%m-%d %H:%M") if last_activity else "—",
             "First Approval": first_approval.strftime("%Y-%m-%d %H:%M") if first_approval else "—",
             "Age (days)": (now - created_at.replace(tzinfo=None)).days,
             "Needs Attention": " | ".join(attention_reasons) if attention_reasons else "",
@@ -236,13 +229,13 @@ def display_closed_prs(prs):
 if pr_state == "Open":
     st.subheader("🟢 Open Pull Requests")
     with st.spinner("Fetching open PRs..."):
-        open_prs = search_prs(all_orgs, selected_users, state="open", days_back=days_back)
+        open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
     display_open_prs(open_prs, exclude_cherrypicks)
 
 elif pr_state == "Closed":
     st.subheader("🔴 Closed Pull Requests")
     with st.spinner("Fetching closed PRs..."):
-        closed_prs = search_prs(all_orgs, selected_users, state="closed", days_back=days_back)
+        closed_prs = search_prs(all_repos, selected_users, state="closed", days_back=days_back)
     display_closed_prs(closed_prs)
 
 else:
@@ -250,12 +243,12 @@ else:
     
     with tab_open:
         with st.spinner("Fetching open PRs..."):
-            open_prs = search_prs(all_orgs, selected_users, state="open", days_back=days_back)
+            open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
         display_open_prs(open_prs, exclude_cherrypicks)
     
     with tab_closed:
         with st.spinner("Fetching closed PRs..."):
-            closed_prs = search_prs(all_orgs, selected_users, state="closed", days_back=days_back)
+            closed_prs = search_prs(all_repos, selected_users, state="closed", days_back=days_back)
         display_closed_prs(closed_prs)
 
 st.divider()
@@ -383,10 +376,11 @@ with st.expander("Configure Slack Integration", expanded=False):
             st.rerun()
     
     if st.button("💾 Save Slack Configuration"):
-        new_config = {
+        current_config = load_config()
+        current_config.update({
             "slack_bot_token": new_token,
             "my_slack_id": my_slack_id,
-            "orgs": all_orgs,
+            "repos": all_repos,
             "usernames": all_usernames,
             "user_slack_mapping": new_mapping,
             "user_display_names": new_names,
@@ -395,9 +389,10 @@ with st.expander("Configure Slack Integration", expanded=False):
             "days_draft_stale": days_draft_stale,
             "days_approved_not_merged": days_approved_not_merged,
             "exclude_drafts": exclude_drafts
-        }
-        save_config(new_config)
+        })
+        save_config(current_config)
         st.success("Configuration saved!")
+        st.rerun()
 
 with st.expander("Preview & Send Reminders", expanded=False):
     st.caption("Preview what messages would be sent, edit if needed, then send")
@@ -436,7 +431,8 @@ with st.expander("Preview & Send Reminders", expanded=False):
         "hours_last_activity": hours_last_activity,
         "days_draft_stale": days_draft_stale,
         "days_approved_not_merged": days_approved_not_merged,
-        "exclude_drafts": exclude_drafts
+        "exclude_drafts": exclude_drafts,
+        "days_back": days_back
     }
     
     if "preview_messages" not in st.session_state:
@@ -450,7 +446,7 @@ with st.expander("Preview & Send Reminders", expanded=False):
     
     if st.button("👁️ Generate Preview"):
         with st.spinner("Analyzing PRs..."):
-            results = send_reminders(all_orgs, selected_users, reminder_config, dry_run=True)
+            results = send_reminders(all_repos, selected_users, reminder_config, dry_run=True)
         st.session_state.preview_messages = {
             r["user"]: {"message": r["message"], "slack_id": r.get("slack_id"), "status": r["status"]}
             for r in results

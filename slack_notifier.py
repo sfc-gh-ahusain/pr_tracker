@@ -2,7 +2,7 @@ import os
 import json
 import requests
 from datetime import datetime, timedelta
-from github_api import search_prs, get_pr_reviews, get_pr_comments, get_pr_details, parse_repo_from_url, get_first_approval_time, get_last_comment_time
+from github_api import search_prs, get_pr_reviews, get_pr_comments, get_pr_review_comments, get_pr_details, parse_repo_from_url, get_first_approval_time, get_last_comment_time, get_last_activity_time
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "slack_config.json")
 
@@ -11,6 +11,22 @@ def load_config():
         with open(CONFIG_FILE, "r") as f:
             return json.load(f)
     return {}
+
+def get_config_with_defaults():
+    config = load_config()
+    if "repos" not in config:
+        config["repos"] = ["snowflakedb/frostdb", "snowflakedb/fdb-tls-tools"]
+    if "orgs" in config:
+        del config["orgs"]
+    if "usernames" not in config:
+        config["usernames"] = [
+            "sfc-gh-alfeng", "sfc-gh-huliu", "sfc-gh-juliu", "sfc-gh-imubarek",
+            "sfc-gh-ynannapaneni", "sfc-gh-speddi", "sfc-gh-tpendock", "sfc-gh-bravi",
+            "sfc-gh-jshim", "sfc-gh-nwijetunga", "sfc-gh-hoyang"
+        ]
+    if "days_back" not in config:
+        config["days_back"] = 90
+    return config
 
 def save_config(config):
     with open(CONFIG_FILE, "w") as f:
@@ -67,8 +83,8 @@ def send_slack_dm(slack_user_id: str, message: str) -> bool:
     
     return True
 
-def find_stale_prs(orgs: list, username: str, hours_inactive: int = 24, exclude_drafts: bool = True) -> list:
-    prs = search_prs(orgs, [username], state="open", days_back=90)
+def find_stale_prs(repos: list, username: str, hours_inactive: int = 24, exclude_drafts: bool = True, days_back: int = 90) -> list:
+    prs = search_prs(repos, [username], state="open", days_back=days_back)
     stale = []
     now = datetime.utcnow()
     
@@ -78,13 +94,15 @@ def find_stale_prs(orgs: list, username: str, hours_inactive: int = 24, exclude_
         owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
         pr_number = pr.get("number")
         
-        comments = get_pr_comments(owner, repo, pr_number) if owner and repo else []
-        last_comment = get_last_comment_time(comments)
+        issue_comments = get_pr_comments(owner, repo, pr_number) if owner and repo else []
+        review_comments = get_pr_review_comments(owner, repo, pr_number) if owner and repo else []
+        reviews = get_pr_reviews(owner, repo, pr_number) if owner and repo else []
+        last_activity = get_last_activity_time(issue_comments, review_comments, reviews)
         
         created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")).replace(tzinfo=None)
-        last_activity = last_comment.replace(tzinfo=None) if last_comment else created_at
+        last_activity_dt = last_activity.replace(tzinfo=None) if last_activity else created_at
         
-        hours_since_activity = (now - last_activity).total_seconds() / 3600
+        hours_since_activity = (now - last_activity_dt).total_seconds() / 3600
         
         if hours_since_activity >= hours_inactive:
             details = get_pr_details(owner, repo, pr_number) if owner and repo else None
@@ -98,8 +116,8 @@ def find_stale_prs(orgs: list, username: str, hours_inactive: int = 24, exclude_
     
     return stale
 
-def find_stale_drafts(orgs: list, username: str, days_draft_stale: int = 7) -> list:
-    prs = search_prs(orgs, [username], state="open", days_back=90)
+def find_stale_drafts(repos: list, username: str, days_draft_stale: int = 7, days_back: int = 90) -> list:
+    prs = search_prs(repos, [username], state="open", days_back=days_back)
     stale_drafts = []
     now = datetime.utcnow()
     
@@ -124,8 +142,8 @@ def find_stale_drafts(orgs: list, username: str, days_draft_stale: int = 7) -> l
     
     return stale_drafts
 
-def find_approved_not_merged(orgs: list, username: str, days_threshold: int = 1, exclude_drafts: bool = True) -> list:
-    prs = search_prs(orgs, [username], state="open", days_back=90)
+def find_approved_not_merged(repos: list, username: str, days_threshold: int = 1, exclude_drafts: bool = True, days_back: int = 90) -> list:
+    prs = search_prs(repos, [username], state="open", days_back=days_back)
     approved_pending = []
     
     for pr in prs:
@@ -194,7 +212,7 @@ def format_reminder_message(username: str, stale_prs: list, approved_prs: list, 
     
     return "\n".join(lines)
 
-def send_reminders(orgs: list, usernames: list, config: dict = None, dry_run: bool = False):
+def send_reminders(repos: list, usernames: list, config: dict = None, dry_run: bool = False):
     if config is None:
         config = load_config()
     
@@ -202,15 +220,16 @@ def send_reminders(orgs: list, usernames: list, config: dict = None, dry_run: bo
     days_draft_stale = config.get("days_draft_stale", 7)
     days_approved_not_merged = config.get("days_approved_not_merged", 1)
     exclude_drafts = config.get("exclude_drafts", True)
+    days_back = config.get("days_back", 90)
     
     user_slack_map = get_user_slack_mapping()
     user_display_names = get_user_display_names()
     results = []
     
     for username in usernames:
-        stale = find_stale_prs(orgs, username, hours_last_activity, exclude_drafts)
-        stale_drafts = [] if exclude_drafts else find_stale_drafts(orgs, username, days_draft_stale)
-        approved = find_approved_not_merged(orgs, username, days_approved_not_merged, exclude_drafts)
+        stale = find_stale_prs(repos, username, hours_last_activity, exclude_drafts, days_back)
+        stale_drafts = [] if exclude_drafts else find_stale_drafts(repos, username, days_draft_stale, days_back)
+        approved = find_approved_not_merged(repos, username, days_approved_not_merged, exclude_drafts, days_back)
         
         display_name = user_display_names.get(username)
         message = format_reminder_message(username, stale, approved, stale_drafts, display_name)
@@ -244,19 +263,15 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="Preview messages without sending")
     args = parser.parse_args()
     
-    config = load_config()
-    orgs = config.get("orgs", ["frostdb", "fdb-tls-tools", "snowflakedb"])
-    usernames = config.get("usernames", [
-        "sfc-gh-alfeng", "sfc-gh-huliu", "sfc-gh-juliu", "sfc-gh-imubarek",
-        "sfc-gh-ynannapaneni", "sfc-gh-speddi", "sfc-gh-tpendock", "sfc-gh-bravi",
-        "sfc-gh-jshim", "sfc-gh-nwijetunga", "sfc-gh-hoyang"
-    ])
+    config = get_config_with_defaults()
+    repos = config.get("repos")
+    usernames = config.get("usernames")
     
     print(f"Running PR reminder ({'DRY RUN' if args.dry_run else 'LIVE'})...")
     print(f"Checking {len(usernames)} users")
     print(f"Config: {json.dumps({k: v for k, v in config.items() if k != 'slack_bot_token'}, indent=2)}\n")
     
-    results = send_reminders(orgs, usernames, config, dry_run=args.dry_run)
+    results = send_reminders(repos, usernames, config, dry_run=args.dry_run)
     
     print(f"\n--- Summary ---")
     for r in results:
