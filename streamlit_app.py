@@ -74,8 +74,13 @@ with st.sidebar:
     exclude_cherrypicks = st.checkbox(
         "Exclude Cherry-Pick PRs",
         value=True,
-        help="Filter out PRs with 'cherry-pick', 'cherrypick', or 'cp-' in the title"
+        key="exclude_cherrypicks_checkbox",
+        help="Filter out PRs targeting release/* branches or with cherry-pick in title"
     )
+    
+    if st.session_state.get("last_exclude_cherrypicks") != exclude_cherrypicks:
+        st.session_state.last_exclude_cherrypicks = exclude_cherrypicks
+        st.session_state.preview_messages = {}
     
     if st.button("🔄 Refresh Data", type="primary"):
         st.cache_data.clear()
@@ -86,13 +91,107 @@ if not all_repos or not selected_users:
 
 st.caption(f"Showing **{len(selected_users)}** team member(s) | **{pr_state}** PRs | Last **{days_back}** days")
 
-def is_cherrypick_pr(title: str) -> bool:
+def is_cherrypick_pr(title: str, base_branch: str = "") -> bool:
     title_lower = title.lower()
-    return any(pattern in title_lower for pattern in ['cherry-pick', 'cherrypick', 'cherry pick', '[cp]', '(cp)'])
+    if any(pattern in title_lower for pattern in ['cherry-pick', 'cherrypick', 'cherry pick', '[cp]', '(cp)']):
+        return True
+    if base_branch.startswith('release/'):
+        return True
+    return False
+
+def generate_preview_from_table_rows(rows, user_display_names, user_slack_mapping):
+    """Generate preview messages from the same data displayed in the table (single source of truth)."""
+    from datetime import datetime
+    results = {}
+    prs_by_user = {}
+    for row in rows:
+        if not row.get("Needs Attention"):
+            continue
+        author = row["Author"]
+        if author not in prs_by_user:
+            prs_by_user[author] = []
+        prs_by_user[author].append(row)
+    
+    today = datetime.now().strftime("%B %d, %Y")
+    
+    for user, user_prs in prs_by_user.items():
+        display_name = user_display_names.get(user, user)
+        slack_id = user_slack_mapping.get(user)
+        
+        pr_entries = []
+        
+        for pr in user_prs:
+            attention = pr.get("Needs Attention", "")
+            title = pr["Title"][:50] + "..." if len(pr["Title"]) > 50 else pr["Title"]
+            pr_num = pr["PR #"]
+            
+            status_parts = []
+            
+            if "inactive" in attention.lower():
+                hours_match = attention.split("h inactive")[0].split("⏰ ")[-1] if "⏰" in attention else "0"
+                try:
+                    hours = int(hours_match)
+                    days = hours // 24
+                    remaining_hours = hours % 24
+                    time_str = f"{days}d {remaining_hours}h" if days > 0 else f"{remaining_hours}h"
+                except:
+                    time_str = "unknown"
+                status_parts.append(f"⏰ Inactive for {time_str}")
+            
+            if "Approved" in attention:
+                first_approval = pr.get("First Approval", "—")
+                if first_approval != "—":
+                    try:
+                        approval_date = datetime.strptime(first_approval, "%Y-%m-%d %H:%M")
+                        days_ago = (datetime.now() - approval_date).days
+                        status_parts.append(f"✅ Approved {days_ago} days ago")
+                    except:
+                        status_parts.append("✅ Approved")
+            
+            if "Stale draft" in attention:
+                status_parts.append("📝 Stale draft")
+            
+            status_str = " | ".join(status_parts)
+            pr_entries.append(f'  • PR #{pr_num}: "{title}"\n    {status_str}')
+        
+        pr_count = len(user_prs)
+        lines = [
+            f"*PR Reminder - {today}*",
+            "",
+            f"Hi {display_name}! You have {pr_count} PR(s) that need attention:",
+            ""
+        ]
+        lines.extend(pr_entries)
+        
+        lines.extend([
+            "---",
+            "Please take a moment to review these PRs. If any are stalled, we would like to understand the blockers so I can help move them forward. Is the inactivity due to:",
+            "a) Pending reviews (stakeholders or area-experts)?",
+            "b) Technical hurdles or shifting priorities?",
+            "Let me know where we can step in to clear the path or nudge the right/concerned folks."
+        ])
+        
+        results[user] = {
+            "message": "\n".join(lines),
+            "slack_id": slack_id,
+            "status": "preview"
+        }
+    
+    return results
 
 def display_open_prs(prs, exclude_cherrypicks=False):
-    if exclude_cherrypicks:
-        prs = [pr for pr in prs if not is_cherrypick_pr(pr.get("title", ""))]
+    filtered_prs = []
+    for pr in prs:
+        if exclude_cherrypicks:
+            owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+            details = get_pr_details(owner, repo, pr.get("number")) if owner and repo else None
+            base_branch = details.get("base", {}).get("ref", "") if details else ""
+            if is_cherrypick_pr(pr.get("title", ""), base_branch):
+                continue
+        filtered_prs.append(pr)
+    prs = filtered_prs
+    
+    st.session_state.filtered_prs = prs
     
     if not prs:
         st.info("No open PRs found.")
@@ -146,6 +245,16 @@ def display_open_prs(prs, exclude_cherrypicks=False):
     
     progress.empty()
     df = pd.DataFrame(rows)
+    st.session_state.pr_table_rows = rows
+    
+    df.insert(0, "Status", df["Needs Attention"].apply(lambda x: "⚠️" if x else "✓"))
+    
+    def highlight_attention(row):
+        if row["Needs Attention"]:
+            return ["background-color: #fff3cd"] * len(row)
+        return [""] * len(row)
+    
+    styled_df = df.style.apply(highlight_attention, axis=1)
     
     needs_attention_count = len(df[df["Needs Attention"] != ""])
     col1, col2, col3, col4 = st.columns(4)
@@ -155,8 +264,9 @@ def display_open_prs(prs, exclude_cherrypicks=False):
     col4.metric("Avg Age (days)", f"{df['Age (days)'].mean():.1f}" if len(df) > 0 else "—")
     
     st.dataframe(
-        df,
+        styled_df,
         column_config={
+            "Status": st.column_config.TextColumn("", width="small"),
             "URL": st.column_config.LinkColumn("Link", display_text="View"),
             "Age (days)": st.column_config.NumberColumn(format="%d days")
         },
@@ -432,6 +542,7 @@ with st.expander("Preview & Send Reminders", expanded=False):
         "days_draft_stale": days_draft_stale,
         "days_approved_not_merged": days_approved_not_merged,
         "exclude_drafts": exclude_drafts,
+        "exclude_cherrypicks": exclude_cherrypicks,
         "days_back": days_back,
         "user_display_names": slack_config.get("user_display_names", {}),
         "user_slack_mapping": slack_config.get("user_slack_mapping", {})
@@ -439,27 +550,19 @@ with st.expander("Preview & Send Reminders", expanded=False):
     
     if "preview_messages" not in st.session_state:
         st.session_state.preview_messages = {}
-    if "preview_users" not in st.session_state:
-        st.session_state.preview_users = []
-    
-    if set(st.session_state.preview_users) != set(selected_users):
-        st.session_state.preview_messages = {}
-        st.session_state.preview_users = selected_users.copy()
     
     if st.button("👁️ Generate Preview"):
-        fresh_config = load_config()
-        reminder_config.update({
-            "user_display_names": fresh_config.get("user_display_names", {}),
-            "user_slack_mapping": fresh_config.get("user_slack_mapping", {})
-        })
-        with st.spinner("Analyzing PRs..."):
-            results = send_reminders(all_repos, selected_users, reminder_config, dry_run=True)
-        st.session_state.preview_messages = {
-            r["user"]: {"message": r["message"], "slack_id": r.get("slack_id"), "status": r["status"]}
-            for r in results
-        }
-        st.session_state.preview_users = selected_users.copy()
-        st.rerun()
+        st.session_state.preview_messages = {}
+        table_rows = st.session_state.get("pr_table_rows", [])
+        if not table_rows:
+            st.warning("No PR data available. Please wait for the table to load.")
+        else:
+            fresh_config = load_config()
+            st.session_state.preview_messages = generate_preview_from_table_rows(
+                table_rows,
+                fresh_config.get("user_display_names", {}),
+                fresh_config.get("user_slack_mapping", {})
+            )
     
     edited_messages = {}
     if st.session_state.preview_messages:

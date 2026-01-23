@@ -6,6 +6,14 @@ from github_api import search_prs, get_pr_reviews, get_pr_comments, get_pr_revie
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "slack_config.json")
 
+def is_cherrypick_pr(title: str, base_branch: str = "") -> bool:
+    title_lower = title.lower()
+    if any(pattern in title_lower for pattern in ['cherry-pick', 'cherrypick', 'cherry pick', '[cp]', '(cp)']):
+        return True
+    if base_branch.startswith('release/'):
+        return True
+    return False
+
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r") as f:
@@ -83,7 +91,7 @@ def send_slack_dm(slack_user_id: str, message: str) -> bool:
     
     return True
 
-def find_stale_prs(repos: list, username: str, hours_inactive: int = 24, exclude_drafts: bool = True, days_back: int = 90) -> list:
+def find_stale_prs(repos: list, username: str, hours_inactive: int = 24, exclude_drafts: bool = True, days_back: int = 90, exclude_cherrypicks: bool = False) -> list:
     prs = search_prs(repos, [username], state="open", days_back=days_back)
     stale = []
     now = datetime.utcnow()
@@ -93,6 +101,12 @@ def find_stale_prs(repos: list, username: str, hours_inactive: int = 24, exclude
             continue
         owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
         pr_number = pr.get("number")
+        
+        details = get_pr_details(owner, repo, pr_number) if owner and repo else None
+        base_branch = details.get("base", {}).get("ref", "") if details else ""
+        
+        if exclude_cherrypicks and is_cherrypick_pr(pr.get("title", ""), base_branch):
+            continue
         
         issue_comments = get_pr_comments(owner, repo, pr_number) if owner and repo else []
         review_comments = get_pr_review_comments(owner, repo, pr_number) if owner and repo else []
@@ -105,8 +119,6 @@ def find_stale_prs(repos: list, username: str, hours_inactive: int = 24, exclude
         hours_since_activity = (now - last_activity_dt).total_seconds() / 3600
         
         if hours_since_activity >= hours_inactive:
-            details = get_pr_details(owner, repo, pr_number) if owner and repo else None
-            base_branch = details.get("base", {}).get("ref", "") if details else ""
             stale.append({
                 "pr": pr,
                 "hours_inactive": int(hours_since_activity),
@@ -116,7 +128,7 @@ def find_stale_prs(repos: list, username: str, hours_inactive: int = 24, exclude
     
     return stale
 
-def find_stale_drafts(repos: list, username: str, days_draft_stale: int = 7, days_back: int = 90) -> list:
+def find_stale_drafts(repos: list, username: str, days_draft_stale: int = 7, days_back: int = 90, exclude_cherrypicks: bool = False) -> list:
     prs = search_prs(repos, [username], state="open", days_back=days_back)
     stale_drafts = []
     now = datetime.utcnow()
@@ -125,14 +137,18 @@ def find_stale_drafts(repos: list, username: str, days_draft_stale: int = 7, day
         if not pr.get("draft", False):
             continue
         
+        owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+        pr_number = pr.get("number")
+        details = get_pr_details(owner, repo, pr_number) if owner and repo else None
+        base_branch = details.get("base", {}).get("ref", "") if details else ""
+        
+        if exclude_cherrypicks and is_cherrypick_pr(pr.get("title", ""), base_branch):
+            continue
+        
         created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")).replace(tzinfo=None)
         days_as_draft = (now - created_at).days
         
         if days_as_draft >= days_draft_stale:
-            owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
-            pr_number = pr.get("number")
-            details = get_pr_details(owner, repo, pr_number) if owner and repo else None
-            base_branch = details.get("base", {}).get("ref", "") if details else ""
             stale_drafts.append({
                 "pr": pr,
                 "days_as_draft": days_as_draft,
@@ -142,7 +158,7 @@ def find_stale_drafts(repos: list, username: str, days_draft_stale: int = 7, day
     
     return stale_drafts
 
-def find_approved_not_merged(repos: list, username: str, days_threshold: int = 1, exclude_drafts: bool = True, days_back: int = 90) -> list:
+def find_approved_not_merged(repos: list, username: str, days_threshold: int = 1, exclude_drafts: bool = True, days_back: int = 90, exclude_cherrypicks: bool = False) -> list:
     prs = search_prs(repos, [username], state="open", days_back=days_back)
     approved_pending = []
     
@@ -152,14 +168,18 @@ def find_approved_not_merged(repos: list, username: str, days_threshold: int = 1
         owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
         pr_number = pr.get("number")
         
+        details = get_pr_details(owner, repo, pr_number) if owner and repo else None
+        base_branch = details.get("base", {}).get("ref", "") if details else ""
+        
+        if exclude_cherrypicks and is_cherrypick_pr(pr.get("title", ""), base_branch):
+            continue
+        
         reviews = get_pr_reviews(owner, repo, pr_number) if owner and repo else []
         first_approval = get_first_approval_time(reviews)
         
         if first_approval:
             days_since_approval = (datetime.utcnow() - first_approval.replace(tzinfo=None)).days
             if days_since_approval >= days_threshold:
-                details = get_pr_details(owner, repo, pr_number) if owner and repo else None
-                base_branch = details.get("base", {}).get("ref", "") if details else ""
                 approved_pending.append({
                     "pr": pr,
                     "days_since_approval": days_since_approval,
@@ -220,6 +240,7 @@ def send_reminders(repos: list, usernames: list, config: dict = None, dry_run: b
     days_draft_stale = config.get("days_draft_stale", 7)
     days_approved_not_merged = config.get("days_approved_not_merged", 1)
     exclude_drafts = config.get("exclude_drafts", True)
+    exclude_cherrypicks = config.get("exclude_cherrypicks", False)
     days_back = config.get("days_back", 90)
     
     user_slack_map = config.get("user_slack_mapping") or get_user_slack_mapping()
@@ -227,9 +248,9 @@ def send_reminders(repos: list, usernames: list, config: dict = None, dry_run: b
     results = []
     
     for username in usernames:
-        stale = find_stale_prs(repos, username, hours_last_activity, exclude_drafts, days_back)
-        stale_drafts = [] if exclude_drafts else find_stale_drafts(repos, username, days_draft_stale, days_back)
-        approved = find_approved_not_merged(repos, username, days_approved_not_merged, exclude_drafts, days_back)
+        stale = find_stale_prs(repos, username, hours_last_activity, exclude_drafts, days_back, exclude_cherrypicks)
+        stale_drafts = [] if exclude_drafts else find_stale_drafts(repos, username, days_draft_stale, days_back, exclude_cherrypicks)
+        approved = find_approved_not_merged(repos, username, days_approved_not_merged, exclude_drafts, days_back, exclude_cherrypicks)
         
         display_name = user_display_names.get(username)
         message = format_reminder_message(username, stale, approved, stale_drafts, display_name)
