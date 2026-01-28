@@ -638,9 +638,139 @@ with st.expander("Preview & Send Reminders", expanded=False):
                 st.success(summary)
 
 st.divider()
+st.header("📅 Schedule Manager")
+
+DAYS_OF_WEEK = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+FREQUENCIES = ["Daily", "Weekly", "Monthly", "Custom Interval"]
+TIMEZONES = ["America/Los_Angeles", "America/New_York", "America/Chicago", "America/Denver", "UTC", "Europe/London", "Asia/Kolkata"]
+
+schedules_config = slack_config.get("schedules", {
+    "team_default": {"enabled": True, "frequency": "weekly", "days_of_week": ["Monday"], "time": "09:00", "timezone": "America/Los_Angeles"},
+    "user_overrides": {}
+})
+team_schedule = schedules_config.get("team_default", {})
+user_overrides = schedules_config.get("user_overrides", {})
+
+with st.expander("🏢 Team Default Schedule", expanded=True):
+    st.caption("This schedule applies to all team members unless they have a personal override.")
+    
+    team_enabled = st.checkbox("Enable team schedule", value=team_schedule.get("enabled", True), key="team_sched_enabled")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        team_freq = st.selectbox("Frequency", FREQUENCIES, index=FREQUENCIES.index(team_schedule.get("frequency", "Weekly").capitalize()) if team_schedule.get("frequency", "weekly").capitalize() in FREQUENCIES else 1, key="team_freq")
+    with col2:
+        team_time = st.time_input("Time", value=datetime.strptime(team_schedule.get("time", "09:00"), "%H:%M").time(), key="team_time")
+    
+    col3, col4 = st.columns(2)
+    with col3:
+        team_tz = st.selectbox("Timezone", TIMEZONES, index=TIMEZONES.index(team_schedule.get("timezone", "America/Los_Angeles")) if team_schedule.get("timezone", "America/Los_Angeles") in TIMEZONES else 0, key="team_tz")
+    
+    if team_freq == "Weekly":
+        team_days = st.multiselect("Days of Week", DAYS_OF_WEEK, default=team_schedule.get("days_of_week", ["Monday"]), key="team_days")
+    elif team_freq == "Monthly":
+        with col4:
+            team_day_of_month = st.number_input("Day of Month", min_value=1, max_value=28, value=team_schedule.get("day_of_month", 1), key="team_dom")
+    elif team_freq == "Custom Interval":
+        with col4:
+            team_interval = st.number_input("Every N days", min_value=1, max_value=90, value=team_schedule.get("interval_days", 7), key="team_interval")
+
+with st.expander("👤 User Schedule Overrides", expanded=False):
+    st.caption("Set custom schedules for specific team members. These override the team default.")
+    
+    user_to_override = st.selectbox("Select user to configure", ["-- Select --"] + all_usernames, key="user_override_select")
+    
+    if user_to_override != "-- Select --":
+        existing = user_overrides.get(user_to_override, {})
+        display_name = slack_config.get("user_display_names", {}).get(user_to_override, user_to_override)
+        
+        st.subheader(f"Schedule for {display_name}")
+        
+        user_has_override = st.checkbox("Enable custom schedule for this user", value=bool(existing), key=f"override_enabled_{user_to_override}")
+        
+        if user_has_override:
+            ucol1, ucol2 = st.columns(2)
+            with ucol1:
+                user_freq = st.selectbox("Frequency", FREQUENCIES, index=FREQUENCIES.index(existing.get("frequency", "Weekly").capitalize()) if existing.get("frequency", "weekly").capitalize() in FREQUENCIES else 1, key=f"user_freq_{user_to_override}")
+            with ucol2:
+                user_time = st.time_input("Time", value=datetime.strptime(existing.get("time", "09:00"), "%H:%M").time(), key=f"user_time_{user_to_override}")
+            
+            ucol3, ucol4 = st.columns(2)
+            with ucol3:
+                user_tz = st.selectbox("Timezone", TIMEZONES, index=TIMEZONES.index(existing.get("timezone", "America/Los_Angeles")) if existing.get("timezone") in TIMEZONES else 0, key=f"user_tz_{user_to_override}")
+            
+            if user_freq == "Weekly":
+                user_days = st.multiselect("Days of Week", DAYS_OF_WEEK, default=existing.get("days_of_week", ["Monday"]), key=f"user_days_{user_to_override}")
+            elif user_freq == "Monthly":
+                with ucol4:
+                    user_dom = st.number_input("Day of Month", min_value=1, max_value=28, value=existing.get("day_of_month", 1), key=f"user_dom_{user_to_override}")
+            elif user_freq == "Custom Interval":
+                with ucol4:
+                    user_interval = st.number_input("Every N days", min_value=1, max_value=90, value=existing.get("interval_days", 7), key=f"user_interval_{user_to_override}")
+    
+    if user_overrides:
+        st.divider()
+        st.write("**Current user overrides:**")
+        for usr, sched in user_overrides.items():
+            disp = slack_config.get("user_display_names", {}).get(usr, usr)
+            freq = sched.get("frequency", "weekly").capitalize()
+            time_str = sched.get("time", "09:00")
+            if freq == "Weekly":
+                days_str = ", ".join(sched.get("days_of_week", []))
+                st.write(f"• **{disp}**: {freq} on {days_str} at {time_str}")
+            elif freq == "Monthly":
+                st.write(f"• **{disp}**: {freq} on day {sched.get('day_of_month', 1)} at {time_str}")
+            elif freq == "Custom interval":
+                st.write(f"• **{disp}**: Every {sched.get('interval_days', 7)} days at {time_str}")
+            else:
+                st.write(f"• **{disp}**: {freq} at {time_str}")
+
+if st.button("💾 Save Schedule Configuration", key="save_schedules"):
+    new_team = {
+        "enabled": team_enabled,
+        "frequency": team_freq.lower(),
+        "time": team_time.strftime("%H:%M"),
+        "timezone": team_tz
+    }
+    if team_freq == "Weekly":
+        new_team["days_of_week"] = team_days
+    elif team_freq == "Monthly":
+        new_team["day_of_month"] = team_day_of_month
+    elif team_freq == "Custom Interval":
+        new_team["interval_days"] = team_interval
+    
+    new_user_overrides = dict(user_overrides)
+    if user_to_override != "-- Select --":
+        if st.session_state.get(f"override_enabled_{user_to_override}", False):
+            user_sched = {
+                "frequency": st.session_state.get(f"user_freq_{user_to_override}", "Weekly").lower(),
+                "time": st.session_state.get(f"user_time_{user_to_override}", datetime.strptime("09:00", "%H:%M").time()).strftime("%H:%M"),
+                "timezone": st.session_state.get(f"user_tz_{user_to_override}", "America/Los_Angeles")
+            }
+            if user_sched["frequency"] == "weekly":
+                user_sched["days_of_week"] = st.session_state.get(f"user_days_{user_to_override}", ["Monday"])
+            elif user_sched["frequency"] == "monthly":
+                user_sched["day_of_month"] = st.session_state.get(f"user_dom_{user_to_override}", 1)
+            elif user_sched["frequency"] == "custom interval":
+                user_sched["interval_days"] = st.session_state.get(f"user_interval_{user_to_override}", 7)
+            new_user_overrides[user_to_override] = user_sched
+        elif user_to_override in new_user_overrides:
+            del new_user_overrides[user_to_override]
+    
+    current_config = load_config()
+    current_config["schedules"] = {
+        "team_default": new_team,
+        "user_overrides": new_user_overrides
+    }
+    save_config(current_config)
+    st.success("Schedule configuration saved!")
+    st.rerun()
+
+st.divider()
 st.caption("""
-**Automated Monday Reminders:** Run `crontab -e` and add:
+**Automated Reminders:** The schedule above controls when reminders are sent. Run `crontab -e` and add:
 ```
-0 9 * * 1 cd /Users/ahusain/pr-dashboard && ./venv/bin/python slack_notifier.py
+* * * * * cd /Users/ahusain/pr-dashboard && ./venv/bin/python slack_notifier.py --check-schedule
 ```
+Runs every minute but is a **NOP unless a schedule matches** - GitHub API is only called when reminders actually need to be sent.
 """)

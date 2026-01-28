@@ -2,9 +2,108 @@ import os
 import json
 import requests
 from datetime import datetime, timedelta
+import pytz
 from github_api import search_prs, get_pr_reviews, get_pr_comments, get_pr_review_comments, get_pr_details, parse_repo_from_url, get_first_approval_time, get_last_comment_time, get_last_activity_time
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "slack_config.json")
+
+LAST_RUN_FILE = os.path.join(os.path.dirname(__file__), ".schedule_last_run.json")
+
+def load_last_run():
+    if os.path.exists(LAST_RUN_FILE):
+        with open(LAST_RUN_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_last_run(data):
+    with open(LAST_RUN_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def get_schedule_for_user(username: str, config: dict) -> dict:
+    schedules = config.get("schedules", {})
+    user_overrides = schedules.get("user_overrides", {})
+    if username in user_overrides:
+        return user_overrides[username]
+    return schedules.get("team_default", {"enabled": True, "frequency": "weekly", "days_of_week": ["Monday"], "time": "09:00", "timezone": "America/Los_Angeles"})
+
+def should_run_now(schedule: dict, last_run_time: datetime = None) -> bool:
+    if not schedule.get("enabled", True):
+        return False
+    
+    tz = pytz.timezone(schedule.get("timezone", "America/Los_Angeles"))
+    now = datetime.now(tz)
+    scheduled_time = datetime.strptime(schedule.get("time", "09:00"), "%H:%M").time()
+    
+    current_hour_min = now.strftime("%H:%M")
+    scheduled_hour_min = schedule.get("time", "09:00")
+    
+    time_match = abs(now.hour * 60 + now.minute - int(scheduled_hour_min.split(":")[0]) * 60 - int(scheduled_hour_min.split(":")[1])) <= 5
+    
+    if not time_match:
+        return False
+    
+    frequency = schedule.get("frequency", "weekly").lower()
+    
+    if frequency == "daily":
+        if last_run_time:
+            last_run_tz = last_run_time.astimezone(tz) if last_run_time.tzinfo else tz.localize(last_run_time)
+            if last_run_tz.date() == now.date():
+                return False
+        return True
+    
+    elif frequency == "weekly":
+        days_of_week = schedule.get("days_of_week", ["Monday"])
+        current_day = now.strftime("%A")
+        if current_day not in days_of_week:
+            return False
+        if last_run_time:
+            last_run_tz = last_run_time.astimezone(tz) if last_run_time.tzinfo else tz.localize(last_run_time)
+            if last_run_tz.date() == now.date():
+                return False
+        return True
+    
+    elif frequency == "monthly":
+        day_of_month = schedule.get("day_of_month", 1)
+        if now.day != day_of_month:
+            return False
+        if last_run_time:
+            last_run_tz = last_run_time.astimezone(tz) if last_run_time.tzinfo else tz.localize(last_run_time)
+            if last_run_tz.month == now.month and last_run_tz.year == now.year:
+                return False
+        return True
+    
+    elif frequency == "custom interval":
+        interval_days = schedule.get("interval_days", 7)
+        if last_run_time:
+            last_run_tz = last_run_time.astimezone(tz) if last_run_time.tzinfo else tz.localize(last_run_time)
+            days_since = (now.date() - last_run_tz.date()).days
+            if days_since < interval_days:
+                return False
+        return True
+    
+    return False
+
+def get_users_to_notify(config: dict) -> list:
+    usernames = config.get("usernames", [])
+    last_runs = load_last_run()
+    users_to_notify = []
+    
+    for username in usernames:
+        schedule = get_schedule_for_user(username, config)
+        last_run_str = last_runs.get(username)
+        last_run_time = datetime.fromisoformat(last_run_str) if last_run_str else None
+        
+        if should_run_now(schedule, last_run_time):
+            users_to_notify.append(username)
+    
+    return users_to_notify
+
+def update_last_run_for_users(usernames: list):
+    last_runs = load_last_run()
+    now_str = datetime.now(pytz.UTC).isoformat()
+    for username in usernames:
+        last_runs[username] = now_str
+    save_last_run(last_runs)
 
 def is_cherrypick_pr(title: str, base_branch: str = "") -> bool:
     title_lower = title.lower()
@@ -282,17 +381,35 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Send PR reminder Slack DMs")
     parser.add_argument("--dry-run", action="store_true", help="Preview messages without sending")
+    parser.add_argument("--check-schedule", action="store_true", help="Check if any scheduled reminders should run now")
+    parser.add_argument("--force", action="store_true", help="Force send to all users, ignoring schedule")
     args = parser.parse_args()
     
     config = get_config_with_defaults()
     repos = config.get("repos")
-    usernames = config.get("usernames")
+    all_usernames = config.get("usernames")
+    
+    if args.check_schedule and not args.force:
+        users_to_notify = get_users_to_notify(config)
+        if not users_to_notify:
+            print(f"[{datetime.now().isoformat()}] No scheduled reminders to send at this time.")
+            exit(0)
+        print(f"[{datetime.now().isoformat()}] Scheduled reminders for: {', '.join(users_to_notify)}")
+        usernames = users_to_notify
+    else:
+        usernames = all_usernames
     
     print(f"Running PR reminder ({'DRY RUN' if args.dry_run else 'LIVE'})...")
     print(f"Checking {len(usernames)} users")
-    print(f"Config: {json.dumps({k: v for k, v in config.items() if k != 'slack_bot_token'}, indent=2)}\n")
+    print(f"Config: {json.dumps({k: v for k, v in config.items() if k not in ['slack_bot_token', 'user_slack_mapping']}, indent=2)}\n")
     
     results = send_reminders(repos, usernames, config, dry_run=args.dry_run)
+    
+    if not args.dry_run and args.check_schedule:
+        sent_users = [r['user'] for r in results if r['status'] == 'sent']
+        if sent_users:
+            update_last_run_for_users(sent_users)
+            print(f"Updated last run time for: {', '.join(sent_users)}")
     
     print(f"\n--- Summary ---")
     for r in results:
