@@ -190,3 +190,180 @@ def get_multiple_prs_full_details(pr_list: list[tuple[str, str, int]]) -> dict:
                 results[pr_key] = {"details": None, "reviews": [], "comments": [], "review_comments": []}
     
     return results
+
+
+@st.cache_data(ttl=3600)
+def search_merged_prs(repos: list[str], usernames: list[str], days_back: int = 90) -> list[dict]:
+    """Search for merged PRs by users."""
+    prs = []
+    since_date = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    repos_lower = [r.lower() for r in repos]
+    
+    def fetch_user_merged_prs(username):
+        user_prs = []
+        query = f"is:pr author:{username} is:merged merged:>={since_date}"
+        url = f"{GITHUB_API_BASE}/search/issues"
+        params = {"q": query, "per_page": 100, "sort": "created", "order": "desc"}
+        try:
+            resp = requests.get(url, headers=get_headers(), params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            for item in data.get("items", []):
+                repo_url = item.get("repository_url", "")
+                repo_path = "/".join(repo_url.split("/")[-2:]).lower() if "/repos/" in repo_url else ""
+                if repo_path in repos_lower:
+                    user_prs.append(item)
+        except Exception:
+            pass
+        return (username, user_prs)
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_user_merged_prs, u): u for u in usernames}
+        for future in as_completed(futures):
+            username, user_prs = future.result()
+            prs.extend(user_prs)
+    
+    return prs
+
+
+@st.cache_data(ttl=3600)
+def search_reviewed_prs(repos: list[str], usernames: list[str], days_back: int = 90) -> dict:
+    """Search for PRs reviewed by users using Pulls API.
+    Search API reviewed-by: doesn't work for private repos, so we fetch closed PRs
+    and check reviews on each.
+    """
+    results = {u: [] for u in usernames}
+    usernames_lower = {u.lower(): u for u in usernames}
+    since_date = datetime.utcnow() - timedelta(days=days_back)
+    seen_prs = {u: set() for u in usernames}
+    
+    def fetch_closed_prs_for_repo(repo):
+        all_prs = []
+        page = 1
+        try:
+            owner, repo_name = repo.split("/")
+        except ValueError:
+            return []
+        
+        while True:
+            url = f"{GITHUB_API_BASE}/repos/{owner}/{repo_name}/pulls"
+            params = {"state": "closed", "per_page": 100, "page": page, "sort": "updated", "direction": "desc"}
+            try:
+                resp = requests.get(url, headers=get_headers(), params=params, timeout=30)
+                resp.raise_for_status()
+                prs = resp.json()
+                if not prs:
+                    break
+                for pr in prs:
+                    updated = pr.get("updated_at", "")
+                    if updated:
+                        pr_date = datetime.fromisoformat(updated.replace("Z", "+00:00")).replace(tzinfo=None)
+                        if pr_date < since_date:
+                            return all_prs
+                    all_prs.append((owner, repo_name, pr))
+                page += 1
+                if len(prs) < 100:
+                    break
+                if page > 10:
+                    break
+            except Exception:
+                break
+        return all_prs
+    
+    def fetch_reviews_for_pr(owner, repo_name, pr):
+        pr_number = pr.get("number")
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo_name}/pulls/{pr_number}/reviews"
+        try:
+            resp = requests.get(url, headers=get_headers(), timeout=30)
+            resp.raise_for_status()
+            reviews = resp.json()
+            return (owner, repo_name, pr, reviews)
+        except Exception:
+            return (owner, repo_name, pr, [])
+    
+    all_closed_prs = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_closed_prs_for_repo, repo): repo for repo in repos}
+        for future in as_completed(futures):
+            prs = future.result()
+            all_closed_prs.extend(prs)
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = []
+        for owner, repo_name, pr in all_closed_prs:
+            futures.append(executor.submit(fetch_reviews_for_pr, owner, repo_name, pr))
+        
+        for future in as_completed(futures):
+            owner, repo_name, pr, reviews = future.result()
+            for review in reviews:
+                reviewer_login = review.get("user", {}).get("login", "").lower()
+                if reviewer_login in usernames_lower:
+                    original_username = usernames_lower[reviewer_login]
+                    pr_id = pr.get("id")
+                    if pr_id not in seen_prs[original_username]:
+                        seen_prs[original_username].add(pr_id)
+                        pr_with_repo = pr.copy()
+                        pr_with_repo["repository_url"] = f"https://api.github.com/repos/{owner}/{repo_name}"
+                        results[original_username].append(pr_with_repo)
+    
+    return results
+
+
+@st.cache_data(ttl=3600)
+def search_review_requested_prs(repos: list[str], usernames: list[str]) -> dict:
+    """Search for open PRs where review is requested from users.
+    Uses Pulls API with requested_reviewers field since Search API review-requested:
+    qualifier doesn't work reliably for private/internal repos.
+    """
+    results = {u: [] for u in usernames}
+    usernames_lower = {u.lower() for u in usernames}
+    
+    def fetch_open_prs_for_repo(repo):
+        all_prs = []
+        page = 1
+        try:
+            owner, repo_name = repo.split("/")
+        except ValueError:
+            return []
+        
+        while True:
+            url = f"{GITHUB_API_BASE}/repos/{owner}/{repo_name}/pulls"
+            params = {"state": "open", "per_page": 100, "page": page}
+            try:
+                resp = requests.get(url, headers=get_headers(), params=params, timeout=30)
+                resp.raise_for_status()
+                prs = resp.json()
+                if not prs:
+                    break
+                all_prs.extend(prs)
+                page += 1
+                if len(prs) < 100:
+                    break
+            except Exception:
+                break
+        return all_prs
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_open_prs_for_repo, repo): repo for repo in repos}
+        for future in as_completed(futures):
+            prs = future.result()
+            for pr in prs:
+                requested_reviewers = pr.get("requested_reviewers", [])
+                for reviewer in requested_reviewers:
+                    login = reviewer.get("login", "").lower()
+                    for username in usernames:
+                        if username.lower() == login:
+                            results[username].append(pr)
+    
+    return results
+
+
+def get_review_time_for_user(reviews: list[dict], pr_created_at: str, username: str) -> Optional[float]:
+    """Calculate time in hours from PR creation to first review by a specific user."""
+    user_reviews = [r for r in reviews if r.get("user", {}).get("login", "").lower() == username.lower()]
+    if not user_reviews:
+        return None
+    user_reviews.sort(key=lambda x: x.get("submitted_at", ""))
+    first_review_time = datetime.fromisoformat(user_reviews[0]["submitted_at"].replace("Z", "+00:00"))
+    pr_created = datetime.fromisoformat(pr_created_at.replace("Z", "+00:00"))
+    return (first_review_time - pr_created).total_seconds() / 3600

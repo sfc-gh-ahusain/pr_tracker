@@ -6,7 +6,8 @@ from datetime import datetime
 from github_api import (
     search_prs, get_pr_details, get_pr_reviews, get_pr_comments, get_pr_review_comments,
     parse_repo_from_url, get_first_approval_time, get_last_comment_time, get_last_activity_time,
-    get_multiple_prs_full_details
+    get_multiple_prs_full_details, search_merged_prs, search_reviewed_prs, 
+    search_review_requested_prs, get_review_time_for_user
 )
 from slack_notifier import load_config, save_config, send_reminders, get_config_with_defaults
 
@@ -88,8 +89,19 @@ with st.sidebar:
         help="Filter out PRs targeting release/* branches or with cherry-pick in title"
     )
     
+    exclude_drafts = st.checkbox(
+        "Exclude Draft PRs",
+        value=False,
+        key="exclude_drafts_checkbox",
+        help="Filter out draft PRs from the table and metrics"
+    )
+    
     if st.session_state.get("last_exclude_cherrypicks") != exclude_cherrypicks:
         st.session_state.last_exclude_cherrypicks = exclude_cherrypicks
+        st.session_state.preview_messages = {}
+    
+    if st.session_state.get("last_exclude_drafts") != exclude_drafts:
+        st.session_state.last_exclude_drafts = exclude_drafts
         st.session_state.preview_messages = {}
     
     if st.button("🔄 Refresh Data", type="primary"):
@@ -253,9 +265,11 @@ def generate_preview_from_table_rows(rows, user_display_names, user_slack_mappin
     
     return results
 
-def display_open_prs(prs, exclude_cherrypicks=False):
+def display_open_prs(prs, exclude_cherrypicks=False, exclude_drafts=False):
     filtered_prs = []
     for pr in prs:
+        if exclude_drafts and pr.get("draft", False):
+            continue
         if exclude_cherrypicks:
             owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
             details = get_pr_details(owner, repo, pr.get("number")) if owner and repo else None
@@ -314,19 +328,20 @@ def display_open_prs(prs, exclude_cherrypicks=False):
         if is_draft and (now - created_at.replace(tzinfo=None)).days >= 7:
             attention_reasons.append("📝 Stale draft")
         
+        pr_title = pr.get("title", "")
+        pr_url = pr.get("html_url", "")
         rows.append({
             "Author": pr.get("user", {}).get("login", "Unknown"),
             "Repository": f"{owner}/{repo}",
-            "PR #": pr_number,
-            "Title": pr.get("title", ""),
+            "PR #": pr_url,
+            "Title": pr_title,
             "Base": base_branch,
             "Draft": "📝" if is_draft else "",
             "Submit Time": created_at.strftime("%Y-%m-%d %H:%M"),
             "Last Activity": last_activity_dt.strftime("%Y-%m-%d %H:%M") if last_activity else "—",
             "First Approval": first_approval.strftime("%Y-%m-%d %H:%M") if first_approval else "—",
             "Age (days)": (now - created_at.replace(tzinfo=None)).days,
-            "Needs Attention": " | ".join(attention_reasons) if attention_reasons else "",
-            "URL": pr.get("html_url", "")
+            "Needs Attention": " | ".join(attention_reasons) if attention_reasons else ""
         })
         progress.progress(50 + int((i + 1) / len(prs) * 50), text=f"Processing {i+1}/{len(prs)} PRs...")
     
@@ -354,7 +369,7 @@ def display_open_prs(prs, exclude_cherrypicks=False):
         styled_df,
         column_config={
             "Status": st.column_config.TextColumn("", width="small"),
-            "URL": st.column_config.LinkColumn("Link", display_text="View"),
+            "PR #": st.column_config.LinkColumn("PR #", display_text="/(\\d+)$", width="small"),
             "Age (days)": st.column_config.NumberColumn(format="%d days")
         },
         use_container_width=True,
@@ -379,19 +394,20 @@ def display_closed_prs(prs):
         created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
         closed_at = datetime.fromisoformat(pr["closed_at"].replace("Z", "+00:00")) if pr.get("closed_at") else None
         
+        pr_title = pr.get("title", "")
+        pr_url = pr.get("html_url", "")
         rows.append({
             "Author": pr.get("user", {}).get("login", "Unknown"),
             "Repository": f"{owner}/{repo}",
-            "PR #": pr_number,
-            "Title": pr.get("title", ""),
+            "PR #": pr_url,
+            "Title": pr_title,
             "Base": base_branch,
             "Merged": "✅" if (details and details.get("merged")) else "❌",
             "Created": created_at.strftime("%Y-%m-%d"),
             "Closed": closed_at.strftime("%Y-%m-%d") if closed_at else "—",
             "Lines Added": additions,
             "Lines Deleted": deletions,
-            "Total Lines": additions + deletions,
-            "URL": pr.get("html_url", "")
+            "Total Lines": additions + deletions
         })
         progress.progress((i + 1) / len(prs))
     
@@ -407,7 +423,7 @@ def display_closed_prs(prs):
     st.dataframe(
         df,
         column_config={
-            "URL": st.column_config.LinkColumn("Link", display_text="View"),
+            "PR #": st.column_config.LinkColumn("PR #", display_text="/(\\d+)$", width="small"),
             "Lines Added": st.column_config.NumberColumn(format="%d ➕"),
             "Lines Deleted": st.column_config.NumberColumn(format="%d ➖"),
             "Total Lines": st.column_config.NumberColumn(format="%d")
@@ -419,15 +435,159 @@ def display_closed_prs(prs):
     st.subheader("📈 Lines Changed by Author")
     author_stats = df.groupby("Author").agg({
         "Total Lines": "sum",
-        "PR #": "count"
-    }).rename(columns={"PR #": "PR Count"}).sort_values("Total Lines", ascending=False)
+        "Title": "count"
+    }).rename(columns={"Title": "PR Count"}).sort_values("Total Lines", ascending=False)
     st.bar_chart(author_stats["Total Lines"])
 
+def display_individual_stats(all_repos, username, days_back, exclude_drafts=False):
+    """Display stats for a single selected user."""
+    config = load_config()
+    user_display_names = config.get("user_display_names", {})
+    display_name = user_display_names.get(username, username)
+    
+    st.subheader(f"📊 Summary for {display_name}")
+    with st.spinner("Fetching metrics..."):
+        merged_prs = search_merged_prs(all_repos, [username], days_back)
+        reviewed_prs = search_reviewed_prs(all_repos, [username], days_back)
+        awaiting_review = search_review_requested_prs(all_repos, [username])
+        
+        if exclude_drafts:
+            merged_prs = [pr for pr in merged_prs if not pr.get("draft", False)]
+            reviewed_prs = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in reviewed_prs.items()}
+            awaiting_review = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in awaiting_review.items()}
+        
+        user_merged = [pr for pr in merged_prs if pr.get("user", {}).get("login") == username]
+        user_reviewed = reviewed_prs.get(username, [])
+        user_awaiting = awaiting_review.get(username, [])
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("🔀 PRs Merged", len(user_merged))
+    with col2:
+        st.metric("👀 PRs Reviewed", len(user_reviewed))
+    with col3:
+        st.metric("⏳ Awaiting Their Review", len(user_awaiting))
+    
+    if user_awaiting:
+        st.subheader(f"📋 PRs Awaiting Review from {display_name}")
+        rows = []
+        for pr in user_awaiting:
+            owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+            created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
+            age_days = (datetime.utcnow() - created_at.replace(tzinfo=None)).days
+            pr_title = pr.get("title", "")
+            pr_url = pr.get("html_url", "")
+            rows.append({
+                "Repository": f"{owner}/{repo}",
+                "PR #": pr_url,
+                "Title": pr_title,
+                "Author": pr.get("user", {}).get("login", "Unknown"),
+                "Age (days)": age_days
+            })
+        
+        df = pd.DataFrame(rows)
+        st.dataframe(
+            df,
+            column_config={
+                "PR #": st.column_config.LinkColumn("PR #", display_text="/(\\d+)$", width="small"),
+                "Age (days)": st.column_config.NumberColumn(format="%d days")
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info(f"No PRs currently awaiting review from {display_name}.")
+
+def display_team_stats(all_repos, selected_users, days_back, exclude_drafts=False):
+    config = load_config()
+    user_display_names = config.get("user_display_names", {})
+    
+    st.subheader("Team Summary")
+    with st.spinner("Fetching team metrics..."):
+        merged_prs = search_merged_prs(all_repos, selected_users, days_back)
+        reviewed_prs = search_reviewed_prs(all_repos, selected_users, days_back)
+        awaiting_review = search_review_requested_prs(all_repos, selected_users)
+        
+        if exclude_drafts:
+            merged_prs = [pr for pr in merged_prs if not pr.get("draft", False)]
+            reviewed_prs = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in reviewed_prs.items()}
+            awaiting_review = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in awaiting_review.items()}
+        
+        total_merged = len(merged_prs)
+        total_reviewed = sum(len(prs) for prs in reviewed_prs.values())
+        total_awaiting = sum(len(prs) for prs in awaiting_review.values())
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("🔀 Total PRs Merged", total_merged)
+    with col2:
+        st.metric("👀 Total PRs Reviewed", total_reviewed)
+    with col3:
+        st.metric("⏳ PRs Awaiting Review", total_awaiting)
+    
+    st.subheader("👥 Team PR Activity")
+    
+    reviewer_data = []
+    for username in selected_users:
+        display_name = user_display_names.get(username, username)
+        prs_reviewed = reviewed_prs.get(username, [])
+        prs_awaiting = awaiting_review.get(username, [])
+        prs_merged_by_user = [pr for pr in merged_prs if pr.get("user", {}).get("login") == username]
+        
+        reviewer_data.append({
+            "Name": display_name,
+            "PRs Merged": len(prs_merged_by_user),
+            "PRs Reviewed": len(prs_reviewed),
+            "Awaiting Their Review": len(prs_awaiting)
+        })
+    
+    df_reviewer = pd.DataFrame(reviewer_data)
+    html_reviewer = df_reviewer.to_html(index=False, escape=False)
+    html_reviewer = html_reviewer.replace('<thead>', '''<thead style="background-color: #4b5563;">''')
+    html_reviewer = html_reviewer.replace('<th>', '''<th style="font-weight: 700; font-size: 15px; color: white; padding: 12px 16px; text-align: left;">''')
+    html_reviewer = html_reviewer.replace('<table ', '''<table style="width: 100%; border-collapse: collapse;" ''')
+    html_reviewer = html_reviewer.replace('<td>', '''<td style="padding: 10px 16px; border-bottom: 1px solid #e5e7eb;">''')
+    st.markdown(html_reviewer, unsafe_allow_html=True)
+    
+    st.subheader("📋 PRs Awaiting Review Details")
+    for username in selected_users:
+        prs_awaiting = awaiting_review.get(username, [])
+        if prs_awaiting:
+            display_name = user_display_names.get(username, username)
+            with st.expander(f"{display_name} ({len(prs_awaiting)} PRs awaiting review)"):
+                for pr in prs_awaiting:
+                    title = pr.get("title", "")[:60] + ("..." if len(pr.get("title", "")) > 60 else "")
+                    pr_url = pr.get("html_url", "")
+                    author = pr.get("user", {}).get("login", "Unknown")
+                    st.markdown(f"• [{pr.get('number')}]({pr_url}) - {title} (by {author})")
+
+select_all_users = len(selected_users) == len(all_usernames)
+
 if pr_state == "Open":
-    st.subheader("🟢 Open Pull Requests")
-    with st.spinner("Fetching open PRs..."):
-        open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
-    display_open_prs(open_prs, exclude_cherrypicks)
+    if select_all_users:
+        tab_prs, tab_stats = st.tabs(["🟢 Open Pull Requests", "📊 Team Stats"])
+        with tab_prs:
+            with st.spinner("Fetching open PRs..."):
+                open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
+            display_open_prs(open_prs, exclude_cherrypicks, exclude_drafts)
+        with tab_stats:
+            display_team_stats(all_repos, selected_users, days_back, exclude_drafts)
+    elif len(selected_users) == 1:
+        tab_prs, tab_stats = st.tabs(["🟢 Open Pull Requests", "📊 Individual Stats"])
+        with tab_prs:
+            with st.spinner("Fetching open PRs..."):
+                open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
+            display_open_prs(open_prs, exclude_cherrypicks, exclude_drafts)
+        with tab_stats:
+            display_individual_stats(all_repos, selected_users[0], days_back, exclude_drafts)
+    else:
+        tab_prs, tab_stats = st.tabs(["🟢 Open Pull Requests", "📊 Selected Members Stats"])
+        with tab_prs:
+            with st.spinner("Fetching open PRs..."):
+                open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
+            display_open_prs(open_prs, exclude_cherrypicks, exclude_drafts)
+        with tab_stats:
+            display_team_stats(all_repos, selected_users, days_back, exclude_drafts)
 
 elif pr_state == "Closed":
     st.subheader("🔴 Closed Pull Requests")
@@ -436,12 +596,23 @@ elif pr_state == "Closed":
     display_closed_prs(closed_prs)
 
 else:
-    tab_open, tab_closed = st.tabs(["🟢 Open PRs", "🔴 Closed PRs"])
+    if select_all_users:
+        tab_open, tab_closed, tab_stats = st.tabs(["🟢 Open PRs", "🔴 Closed PRs", "📊 Team Stats"])
+    elif len(selected_users) == 1:
+        tab_open, tab_closed, tab_stats = st.tabs(["🟢 Open PRs", "🔴 Closed PRs", "📊 Individual Stats"])
+    else:
+        tab_open, tab_closed, tab_stats = st.tabs(["🟢 Open PRs", "🔴 Closed PRs", "📊 Selected Members Stats"])
     
     with tab_open:
         with st.spinner("Fetching open PRs..."):
             open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
-        display_open_prs(open_prs, exclude_cherrypicks)
+        display_open_prs(open_prs, exclude_cherrypicks, exclude_drafts)
+    
+    with tab_stats:
+        if len(selected_users) == 1:
+            display_individual_stats(all_repos, selected_users[0], days_back, exclude_drafts)
+        else:
+            display_team_stats(all_repos, selected_users, days_back, exclude_drafts)
     
     with tab_closed:
         with st.spinner("Fetching closed PRs..."):
@@ -457,7 +628,7 @@ st.subheader("Reminder Thresholds")
 
 col1, col2, col3, col4 = st.columns(4)
 with col4:
-    exclude_drafts = st.checkbox(
+    exclude_drafts_reminders = st.checkbox(
         "Exclude all draft PR reminders",
         value=slack_config.get("exclude_drafts", True),
         help="When checked, draft PRs are excluded from all reminders",
@@ -476,7 +647,7 @@ with col2:
         min_value=1, max_value=30, value=slack_config.get("days_draft_stale", 7),
         help="Remind if PR is draft for this many days",
         key="days_draft_stale",
-        disabled=exclude_drafts
+        disabled=exclude_drafts_reminders
     )
 with col3:
     days_approved_not_merged = st.number_input(
@@ -585,7 +756,7 @@ with st.expander("Configure Slack Integration", expanded=False):
             "hours_last_activity": hours_last_activity,
             "days_draft_stale": days_draft_stale,
             "days_approved_not_merged": days_approved_not_merged,
-            "exclude_drafts": exclude_drafts
+            "exclude_drafts": exclude_drafts_reminders
         })
         save_config(current_config)
         st.success("Configuration saved!")
@@ -668,11 +839,44 @@ with st.expander("Preview & Send Reminders", expanded=False):
             with tab_stats:
                 data = st.session_state.preview_messages["__consolidated__"]
                 user_stats = data.get("user_stats", [])
-                if user_stats:
-                    import pandas as pd
-                    df_stats = pd.DataFrame(user_stats)
+                
+                exclude_drafts = st.checkbox("Exclude Draft PRs", value=False, key="exclude_drafts_stats")
+                
+                st.subheader("Team Summary")
+                with st.spinner("Fetching team metrics..."):
+                    merged_prs = search_merged_prs(all_repos, selected_users, days_back)
+                    reviewed_prs = search_reviewed_prs(all_repos, selected_users, days_back)
+                    awaiting_review = search_review_requested_prs(all_repos, selected_users)
                     
-                    st.subheader("Summary Table")
+                    if exclude_drafts:
+                        merged_prs = [pr for pr in merged_prs if not pr.get("draft", False)]
+                        reviewed_prs = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in reviewed_prs.items()}
+                        awaiting_review = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in awaiting_review.items()}
+                    
+                    total_merged = len(merged_prs)
+                    total_reviewed = sum(len(prs) for prs in reviewed_prs.values())
+                    total_awaiting = sum(len(prs) for prs in awaiting_review.values())
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("🔀 Total PRs Merged", total_merged)
+                with col2:
+                    st.metric("👀 Total PRs Reviewed", total_reviewed)
+                with col3:
+                    st.metric("⏳ PRs Awaiting Review", total_awaiting)
+                
+                if user_stats:
+                    if exclude_drafts:
+                        filtered_stats = []
+                        for stat in user_stats:
+                            new_stat = stat.copy()
+                            new_stat["Stale Drafts"] = 0
+                            filtered_stats.append(new_stat)
+                        df_stats = pd.DataFrame(filtered_stats)
+                    else:
+                        df_stats = pd.DataFrame(user_stats)
+                    
+                    st.subheader("Attention Summary Table")
                     html_table = df_stats.to_html(index=False, escape=False)
                     html_table = html_table.replace('<thead>', '''<thead style="background-color: #4b5563;">''')
                     html_table = html_table.replace('<th>', '''<th style="font-weight: 700; font-size: 15px; color: white; padding: 12px 16px; text-align: left;">''')
@@ -683,14 +887,41 @@ with st.expander("Preview & Send Reminders", expanded=False):
                     st.subheader("PRs by Team Member")
                     chart_data = df_stats.set_index("Name")[["Inactive", "Approved (not merged)", "Stale Drafts"]]
                     st.bar_chart(chart_data)
+                
+                st.subheader("👤 Individual Reviewer Activity")
+                user_display_names = slack_config.get("user_display_names", {})
+                
+                reviewer_data = []
+                for username in selected_users:
+                    display_name = user_display_names.get(username, username)
+                    prs_reviewed = reviewed_prs.get(username, [])
+                    prs_awaiting = awaiting_review.get(username, [])
                     
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Total PRs Needing Attention", df_stats["Total PRs"].sum())
-                    with col2:
-                        st.metric("Team Members", len(df_stats))
-                    with col3:
-                        st.metric("Avg PRs per Person", f"{df_stats['Total PRs'].mean():.1f}")
+                    reviewer_data.append({
+                        "Name": display_name,
+                        "PRs Reviewed": len(prs_reviewed),
+                        "Awaiting Their Review": len(prs_awaiting)
+                    })
+                
+                df_reviewer = pd.DataFrame(reviewer_data)
+                html_reviewer = df_reviewer.to_html(index=False, escape=False)
+                html_reviewer = html_reviewer.replace('<thead>', '''<thead style="background-color: #4b5563;">''')
+                html_reviewer = html_reviewer.replace('<th>', '''<th style="font-weight: 700; font-size: 15px; color: white; padding: 12px 16px; text-align: left;">''')
+                html_reviewer = html_reviewer.replace('<table ', '''<table style="width: 100%; border-collapse: collapse;" ''')
+                html_reviewer = html_reviewer.replace('<td>', '''<td style="padding: 10px 16px; border-bottom: 1px solid #e5e7eb;">''')
+                st.markdown(html_reviewer, unsafe_allow_html=True)
+                
+                st.subheader("📋 PRs Awaiting Review Details")
+                for username in selected_users:
+                    prs_awaiting = awaiting_review.get(username, [])
+                    if prs_awaiting:
+                        display_name = user_display_names.get(username, username)
+                        with st.expander(f"{display_name} ({len(prs_awaiting)} PRs awaiting review)"):
+                            for pr in prs_awaiting:
+                                title = pr.get("title", "")[:60] + ("..." if len(pr.get("title", "")) > 60 else "")
+                                pr_url = pr.get("html_url", "")
+                                author = pr.get("user", {}).get("login", "Unknown")
+                                st.markdown(f"• [{pr.get('number')}]({pr_url}) - {title} (by {author})")
             
             with tab_messages:
                 st.subheader("Consolidated Team Summary")
