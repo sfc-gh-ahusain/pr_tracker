@@ -5,7 +5,8 @@ import os
 from datetime import datetime
 from github_api import (
     search_prs, get_pr_details, get_pr_reviews, get_pr_comments, get_pr_review_comments,
-    parse_repo_from_url, get_first_approval_time, get_last_comment_time, get_last_activity_time
+    parse_repo_from_url, get_first_approval_time, get_last_comment_time, get_last_activity_time,
+    get_multiple_prs_full_details
 )
 from slack_notifier import load_config, save_config, send_reminders, get_config_with_defaults
 
@@ -31,15 +32,22 @@ with st.sidebar:
     )
     all_usernames = [u.strip() for u in usernames_input.strip().split("\n") if u.strip()]
     
-    if st.button("💾 Save Config"):
-        current_config = load_config()
-        current_config.update({
-            "repos": all_repos,
-            "usernames": all_usernames
-        })
-        save_config(current_config)
-        st.success("Configuration saved!")
-        st.rerun()
+    col_save, col_clear = st.columns(2)
+    with col_save:
+        if st.button("💾 Save Config"):
+            current_config = load_config()
+            current_config.update({
+                "repos": all_repos,
+                "usernames": all_usernames
+            })
+            save_config(current_config)
+            st.success("Configuration saved!")
+            st.rerun()
+    with col_clear:
+        if st.button("🔄 Clear Cache"):
+            st.cache_data.clear()
+            st.success("Cache cleared!")
+            st.rerun()
     
     st.divider()
     st.subheader("🎯 Filters")
@@ -62,6 +70,8 @@ with st.sidebar:
             default=[],
             help="Choose one or more team members"
         )
+    
+    st.session_state.selected_users = selected_users
     
     pr_state = st.radio(
         "PR Status",
@@ -99,7 +109,7 @@ def is_cherrypick_pr(title: str, base_branch: str = "") -> bool:
         return True
     return False
 
-def generate_preview_from_table_rows(rows, user_display_names, user_slack_mapping):
+def generate_preview_from_table_rows(rows, user_display_names, user_slack_mapping, consolidated=False):
     """Generate preview messages from the same data displayed in the table (single source of truth)."""
     from datetime import datetime
     results = {}
@@ -177,6 +187,70 @@ def generate_preview_from_table_rows(rows, user_display_names, user_slack_mappin
             "status": "preview"
         }
     
+    if consolidated and len(results) > 1:
+        all_pr_entries = []
+        total_prs = 0
+        user_stats = []
+        for user, user_prs in prs_by_user.items():
+            display_name = user_display_names.get(user, user)
+            inactive_count = 0
+            approved_count = 0
+            stale_draft_count = 0
+            all_pr_entries.append(f"\n*{display_name}:*")
+            for pr in user_prs:
+                attention = pr.get("Needs Attention", "")
+                title = pr["Title"][:50] + "..." if len(pr["Title"]) > 50 else pr["Title"]
+                pr_num = pr["PR #"]
+                status_parts = []
+                if "inactive" in attention.lower():
+                    hours_match = attention.split("h inactive")[0].split("⏰ ")[-1] if "⏰" in attention else "0"
+                    try:
+                        hours = int(hours_match)
+                        days = hours // 24
+                        remaining_hours = hours % 24
+                        time_str = f"{days}d {remaining_hours}h" if days > 0 else f"{remaining_hours}h"
+                    except:
+                        time_str = "unknown"
+                    status_parts.append(f"⏰ Inactive for {time_str}")
+                    inactive_count += 1
+                if "Approved" in attention:
+                    status_parts.append("✅ Approved")
+                    approved_count += 1
+                if "Stale draft" in attention:
+                    status_parts.append("📝 Stale draft")
+                    stale_draft_count += 1
+                status_str = " | ".join(status_parts)
+                all_pr_entries.append(f'  • PR #{pr_num}: "{title}"')
+                if status_str:
+                    all_pr_entries[-1] += f"\n    {status_str}"
+                total_prs += 1
+            user_stats.append({
+                "Name": display_name,
+                "Total PRs": len(user_prs),
+                "Inactive": inactive_count,
+                "Approved (not merged)": approved_count,
+                "Stale Drafts": stale_draft_count
+            })
+        
+        consolidated_lines = [
+            f"*Team PR Summary - {today}*",
+            "",
+            f"There are *{total_prs}* PR(s) across *{len(prs_by_user)}* team members that need attention:",
+        ]
+        consolidated_lines.extend(all_pr_entries)
+        consolidated_lines.extend([
+            "",
+            "---",
+            "Please follow up with team members on stalled PRs."
+        ])
+        
+        results["__consolidated__"] = {
+            "message": "\n".join(consolidated_lines),
+            "slack_id": None,
+            "status": "preview",
+            "user_stats": user_stats
+        }
+    
     return results
 
 def display_open_prs(prs, exclude_cherrypicks=False):
@@ -195,20 +269,33 @@ def display_open_prs(prs, exclude_cherrypicks=False):
     
     if not prs:
         st.info("No open PRs found.")
+        st.session_state.pr_table_rows = []
         return
     
     rows = []
-    progress = st.progress(0)
+    progress = st.progress(0, text="Fetching PR details in parallel...")
     now = datetime.utcnow()
+    
+    pr_keys = []
+    for pr in prs:
+        owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+        pr_number = pr.get("number")
+        if owner and repo:
+            pr_keys.append((owner, repo, pr_number))
+    
+    all_pr_data = get_multiple_prs_full_details(pr_keys)
+    progress.progress(50, text="Processing PR data...")
     
     for i, pr in enumerate(prs):
         owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
         pr_number = pr.get("number")
         
-        reviews = get_pr_reviews(owner, repo, pr_number) if owner and repo else []
-        issue_comments = get_pr_comments(owner, repo, pr_number) if owner and repo else []
-        review_comments = get_pr_review_comments(owner, repo, pr_number) if owner and repo else []
-        details = get_pr_details(owner, repo, pr_number) if owner and repo else None
+        pr_data = all_pr_data.get((owner, repo, pr_number), {})
+        reviews = pr_data.get("reviews", [])
+        issue_comments = pr_data.get("comments", [])
+        review_comments = pr_data.get("review_comments", [])
+        details = pr_data.get("details")
+        
         first_approval = get_first_approval_time(reviews)
         last_activity = get_last_activity_time(issue_comments, review_comments, reviews)
         base_branch = details.get("base", {}).get("ref", "—") if details else "—"
@@ -241,7 +328,7 @@ def display_open_prs(prs, exclude_cherrypicks=False):
             "Needs Attention": " | ".join(attention_reasons) if attention_reasons else "",
             "URL": pr.get("html_url", "")
         })
-        progress.progress((i + 1) / len(prs))
+        progress.progress(50 + int((i + 1) / len(prs) * 50), text=f"Processing {i+1}/{len(prs)} PRs...")
     
     progress.empty()
     df = pd.DataFrame(rows)
@@ -551,6 +638,9 @@ with st.expander("Preview & Send Reminders", expanded=False):
     if "preview_messages" not in st.session_state:
         st.session_state.preview_messages = {}
     
+    selected_users = st.session_state.get("selected_users", [])
+    show_consolidated_option = len(selected_users) > 1
+    
     if st.button("👁️ Generate Preview"):
         st.session_state.preview_messages = {}
         table_rows = st.session_state.get("pr_table_rows", [])
@@ -561,30 +651,79 @@ with st.expander("Preview & Send Reminders", expanded=False):
             st.session_state.preview_messages = generate_preview_from_table_rows(
                 table_rows,
                 fresh_config.get("user_display_names", {}),
-                fresh_config.get("user_slack_mapping", {})
+                fresh_config.get("user_slack_mapping", {}),
+                consolidated=show_consolidated_option
             )
+            if not st.session_state.preview_messages:
+                st.info("No PRs need attention - no reminders to send.")
     
     edited_messages = {}
+    consolidated_message = None
     if st.session_state.preview_messages:
-        for user, data in st.session_state.preview_messages.items():
-            if data["status"] == "no_prs":
-                st.info(f"**{user}**: No PRs need attention")
-            else:
-                slack_id = data.get("slack_id", "NOT MAPPED")
-                st.markdown(f"**{user}** (Slack: `{slack_id}`)")
-                edited_messages[user] = st.text_area(
-                    f"Message for {user}",
+        has_consolidated = "__consolidated__" in st.session_state.preview_messages
+        
+        if has_consolidated:
+            tab_messages, tab_stats = st.tabs(["📝 Messages", "📊 Team Stats"])
+            
+            with tab_stats:
+                data = st.session_state.preview_messages["__consolidated__"]
+                user_stats = data.get("user_stats", [])
+                if user_stats:
+                    import pandas as pd
+                    df_stats = pd.DataFrame(user_stats)
+                    
+                    st.subheader("Summary Table")
+                    html_table = df_stats.to_html(index=False, escape=False)
+                    html_table = html_table.replace('<thead>', '''<thead style="background-color: #4b5563;">''')
+                    html_table = html_table.replace('<th>', '''<th style="font-weight: 700; font-size: 15px; color: white; padding: 12px 16px; text-align: left;">''')
+                    html_table = html_table.replace('<table ', '''<table style="width: 100%; border-collapse: collapse;" ''')
+                    html_table = html_table.replace('<td>', '''<td style="padding: 10px 16px; border-bottom: 1px solid #e5e7eb;">''')
+                    st.markdown(html_table, unsafe_allow_html=True)
+                    
+                    st.subheader("PRs by Team Member")
+                    chart_data = df_stats.set_index("Name")[["Inactive", "Approved (not merged)", "Stale Drafts"]]
+                    st.bar_chart(chart_data)
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Total PRs Needing Attention", df_stats["Total PRs"].sum())
+                    with col2:
+                        st.metric("Team Members", len(df_stats))
+                    with col3:
+                        st.metric("Avg PRs per Person", f"{df_stats['Total PRs'].mean():.1f}")
+            
+            with tab_messages:
+                st.subheader("Consolidated Team Summary")
+                consolidated_message = st.text_area(
+                    "Consolidated Message",
                     value=data["message"],
-                    height=250,
-                    key=f"msg_{user}",
+                    height=400,
+                    key="msg_consolidated",
                     label_visibility="collapsed"
                 )
+        else:
+            for user, data in st.session_state.preview_messages.items():
+                if data["status"] == "no_prs":
+                    st.info(f"**{user}**: No PRs need attention")
+                else:
+                    slack_id = data.get("slack_id", "NOT MAPPED")
+                    st.markdown(f"**{user}** (Slack: `{slack_id}`)")
+                    edited_messages[user] = st.text_area(
+                        f"Message for {user}",
+                        value=data["message"],
+                        height=250,
+                        key=f"msg_{user}",
+                        label_visibility="collapsed"
+                    )
         
-        if cc_recipients:
+        if cc_recipients and not consolidated_message:
             st.info(f"📋 CC: {', '.join(cc_recipients)}")
         
         st.divider()
-        if st.button("🚀 Send Edited Messages", type="primary"):
+        
+        if consolidated_message:
+            st.info("💡 Consolidated view is for review only. Copy the message above to share manually, or uncheck 'Consolidated view' to send individual messages.")
+        elif st.button("🚀 Send Edited Messages", type="primary"):
             token = slack_config.get("slack_bot_token", "")
             if not token or token == "xoxb-YOUR-BOT-TOKEN-HERE":
                 st.error("Please configure a valid Slack Bot Token first!")
