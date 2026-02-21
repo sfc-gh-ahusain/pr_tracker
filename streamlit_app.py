@@ -353,7 +353,7 @@ def display_open_prs(prs, exclude_cherrypicks=False, exclude_drafts=False):
     
     def highlight_attention(row):
         if row["Needs Attention"]:
-            return ["background-color: #fff3cd"] * len(row)
+            return ["background-color: rgba(251, 146, 60, 0.25)"] * len(row)
         return [""] * len(row)
     
     styled_df = df.style.apply(highlight_attention, axis=1)

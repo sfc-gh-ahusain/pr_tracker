@@ -32,7 +32,10 @@ def search_prs(repos: list[str], usernames: list[str], state: str = "open", days
         url = f"{GITHUB_API_BASE}/search/issues"
         params = {"q": query, "per_page": 100, "sort": "created", "order": "desc"}
         try:
-            resp = requests.get(url, headers=get_headers(), params=params, timeout=30)
+            hdrs = get_headers()
+            resp = requests.get(url, headers=hdrs, params=params, timeout=30)
+            if resp.status_code == 401:
+                st.error(f"GitHub API returned 401 Unauthorized - check your GITHUB_TOKEN")
             resp.raise_for_status()
             data = resp.json()
             total_found = data.get("total_count", 0)
