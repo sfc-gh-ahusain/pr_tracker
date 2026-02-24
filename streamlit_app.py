@@ -7,7 +7,7 @@ from github_api import (
     search_prs, get_pr_details, get_pr_reviews, get_pr_comments, get_pr_review_comments,
     parse_repo_from_url, get_first_approval_time, get_last_comment_time, get_last_activity_time,
     get_multiple_prs_full_details, search_merged_prs, search_reviewed_prs, 
-    search_review_requested_prs, get_review_time_for_user
+    search_review_requested_prs, get_review_time_for_user, search_prs_where_user_is_reviewer
 )
 from slack_notifier import load_config, save_config, send_reminders, get_config_with_defaults
 
@@ -53,7 +53,7 @@ with st.sidebar:
     st.divider()
     st.subheader("🎯 Filters")
     
-    select_all = st.checkbox("Select All Team Members", value=True)
+    select_all = st.checkbox("Select All Team Members", value=False)
     
     if select_all:
         selected_users = all_usernames
@@ -80,7 +80,7 @@ with st.sidebar:
         horizontal=True
     )
     
-    days_back = st.slider("Days to look back", 7, 365, 90)
+    days_back = st.slider("Days to look back", 7, 365, 15)
     
     exclude_cherrypicks = st.checkbox(
         "Exclude Cherry-Pick PRs",
@@ -121,9 +121,10 @@ def is_cherrypick_pr(title: str, base_branch: str = "") -> bool:
         return True
     return False
 
-def generate_preview_from_table_rows(rows, user_display_names, user_slack_mapping, consolidated=False):
+def generate_preview_from_table_rows(rows, user_display_names, user_slack_mapping, consolidated=False, awaiting_review_by_user=None):
     """Generate preview messages from the same data displayed in the table (single source of truth)."""
     from datetime import datetime
+    awaiting_review_by_user = awaiting_review_by_user or {}
     results = {}
     prs_by_user = {}
     for row in rows:
@@ -134,86 +135,36 @@ def generate_preview_from_table_rows(rows, user_display_names, user_slack_mappin
             prs_by_user[author] = []
         prs_by_user[author].append(row)
     
+    all_users = set(prs_by_user.keys()) | set(awaiting_review_by_user.keys())
     today = datetime.now().strftime("%B %d, %Y")
     
-    for user, user_prs in prs_by_user.items():
+    for user in all_users:
+        user_prs = prs_by_user.get(user, [])
+        user_awaiting = awaiting_review_by_user.get(user, [])
         display_name = user_display_names.get(user, user)
         slack_id = user_slack_mapping.get(user)
         
-        pr_entries = []
+        total_count = len(user_prs) + len(user_awaiting)
+        if total_count == 0:
+            continue
         
-        for pr in user_prs:
-            attention = pr.get("Needs Attention", "")
-            title = pr["Title"][:50] + "..." if len(pr["Title"]) > 50 else pr["Title"]
-            pr_num = pr["PR #"]
-            
-            status_parts = []
-            
-            if "inactive" in attention.lower():
-                hours_match = attention.split("h inactive")[0].split("⏰ ")[-1] if "⏰" in attention else "0"
-                try:
-                    hours = int(hours_match)
-                    days = hours // 24
-                    remaining_hours = hours % 24
-                    time_str = f"{days}d {remaining_hours}h" if days > 0 else f"{remaining_hours}h"
-                except:
-                    time_str = "unknown"
-                status_parts.append(f"⏰ Inactive for {time_str}")
-            
-            if "Approved" in attention:
-                first_approval = pr.get("First Approval", "—")
-                if first_approval != "—":
-                    try:
-                        approval_date = datetime.strptime(first_approval, "%Y-%m-%d %H:%M")
-                        days_ago = (datetime.now() - approval_date).days
-                        status_parts.append(f"✅ Approved {days_ago} days ago")
-                    except:
-                        status_parts.append("✅ Approved")
-            
-            if "Stale draft" in attention:
-                status_parts.append("📝 Stale draft")
-            
-            status_str = " | ".join(status_parts)
-            pr_entries.append(f'  • PR #{pr_num}: "{title}"\n    {status_str}')
-        
-        pr_count = len(user_prs)
         lines = [
             f"*PR Reminder - {today}*",
             "",
-            f"Hi {display_name}! You have {pr_count} PR(s) that need attention:",
+            f"Hi {display_name}! You have {total_count} PR(s) that need attention:",
             ""
         ]
-        lines.extend(pr_entries)
         
-        lines.extend([
-            "---",
-            "Please take a moment to review these PRs. If any are stalled, we would like to understand the blockers so I can help move them forward. Is the inactivity due to:",
-            "a) Pending reviews (stakeholders or area-experts)?",
-            "b) Technical hurdles or shifting priorities?",
-            "Let me know where we can step in to clear the path or nudge the right/concerned folks."
-        ])
-        
-        results[user] = {
-            "message": "\n".join(lines),
-            "slack_id": slack_id,
-            "status": "preview"
-        }
-    
-    if consolidated and len(results) > 1:
-        all_pr_entries = []
-        total_prs = 0
-        user_stats = []
-        for user, user_prs in prs_by_user.items():
-            display_name = user_display_names.get(user, user)
-            inactive_count = 0
-            approved_count = 0
-            stale_draft_count = 0
-            all_pr_entries.append(f"\n*{display_name}:*")
+        if user_prs:
+            lines.append("*📂 Your Open PRs:*")
             for pr in user_prs:
                 attention = pr.get("Needs Attention", "")
                 title = pr["Title"][:50] + "..." if len(pr["Title"]) > 50 else pr["Title"]
-                pr_num = pr["PR #"]
+                pr_url = pr["PR #"]
+                pr_num = pr_url.split("/")[-1] if "/" in pr_url else pr_url
+                
                 status_parts = []
+                
                 if "inactive" in attention.lower():
                     hours_match = attention.split("h inactive")[0].split("⏰ ")[-1] if "⏰" in attention else "0"
                     try:
@@ -223,31 +174,116 @@ def generate_preview_from_table_rows(rows, user_display_names, user_slack_mappin
                         time_str = f"{days}d {remaining_hours}h" if days > 0 else f"{remaining_hours}h"
                     except:
                         time_str = "unknown"
-                    status_parts.append(f"⏰ Inactive for {time_str}")
-                    inactive_count += 1
+                    status_parts.append(f"⏰ {time_str}")
+                
                 if "Approved" in attention:
-                    status_parts.append("✅ Approved")
-                    approved_count += 1
+                    first_approval = pr.get("First Approval", "—")
+                    if first_approval != "—":
+                        try:
+                            approval_date = datetime.strptime(first_approval, "%Y-%m-%d %H:%M")
+                            days_ago = (datetime.now() - approval_date).days
+                            status_parts.append(f"✅ {days_ago}d ago")
+                        except:
+                            status_parts.append("✅ Approved")
+                
                 if "Stale draft" in attention:
-                    status_parts.append("📝 Stale draft")
-                    stale_draft_count += 1
-                status_str = " | ".join(status_parts)
-                all_pr_entries.append(f'  • PR #{pr_num}: "{title}"')
+                    status_parts.append("📝 Draft")
+                
+                status_str = " | ".join(status_parts) if status_parts else ""
+                line = f'  • <{pr_url}|PR #{pr_num}>: "{title}"'
                 if status_str:
-                    all_pr_entries[-1] += f"\n    {status_str}"
-                total_prs += 1
+                    line += f" - {status_str}"
+                lines.append(line)
+        
+        if user_awaiting:
+            lines.append("")
+            lines.append("*👀 PRs Awaiting Your Review:*")
+            for pr_data in user_awaiting:
+                pr = pr_data.get("pr", pr_data)
+                pr_url = pr.get("html_url", "")
+                pr_num = pr.get("number", pr_url.split("/")[-1] if "/" in pr_url else "?")
+                title = pr.get("title", "")[:50]
+                author = pr.get("user", {}).get("login", "unknown")
+                hours = pr_data.get("hours_waiting", 0)
+                sla = "🔴" if hours >= 24 else "🟢"
+                time_str = f"{int(hours // 24)}d {int(hours % 24)}h" if hours >= 24 else f"{int(hours)}h"
+                lines.append(f'  • {sla} <{pr_url}|PR #{pr_num}>: "{title}" by {author} - {time_str}')
+        
+        lines.append("")
+        lines.append("---")
+        lines.append("Please take a moment to review these PRs. If any are stalled, we would like to understand the blockers so I can help move them forward. Is the inactivity due to:")
+        lines.append("a) Pending reviews (stakeholders or area-experts)?")
+        lines.append("b) Technical hurdles or shifting priorities?")
+        lines.append("Let me know where we can step in to clear the path or nudge the right/concerned folks.")
+        
+        results[user] = {
+            "message": "\n".join(lines),
+            "slack_id": slack_id,
+            "status": "preview"
+        }
+    
+    if consolidated and len(all_users) > 1:
+        all_pr_entries = []
+        total_prs = 0
+        user_stats = []
+        for user in all_users:
+            user_prs = prs_by_user.get(user, [])
+            user_awaiting = awaiting_review_by_user.get(user, [])
+            display_name = user_display_names.get(user, user)
+            inactive_count = 0
+            approved_count = 0
+            stale_draft_count = 0
+            awaiting_count = len(user_awaiting)
+            
+            all_pr_entries.append(f"\n*{display_name}:*")
+            
+            if user_prs:
+                all_pr_entries.append("  _Open PRs:_")
+                for pr in user_prs:
+                    attention = pr.get("Needs Attention", "")
+                    title = pr["Title"][:50] + "..." if len(pr["Title"]) > 50 else pr["Title"]
+                    pr_url = pr["PR #"]
+                    pr_num = pr_url.split("/")[-1] if "/" in pr_url else pr_url
+                    status_parts = []
+                    if "inactive" in attention.lower():
+                        status_parts.append("⏰")
+                        inactive_count += 1
+                    if "Approved" in attention:
+                        status_parts.append("✅")
+                        approved_count += 1
+                    if "Stale draft" in attention:
+                        status_parts.append("📝")
+                        stale_draft_count += 1
+                    status_str = " ".join(status_parts)
+                    line = f'    • <{pr_url}|PR #{pr_num}>: "{title}"'
+                    if status_str:
+                        line += f" {status_str}"
+                    all_pr_entries.append(line)
+                    total_prs += 1
+            
+            if user_awaiting:
+                all_pr_entries.append("  _Awaiting Review:_")
+                for pr_data in user_awaiting:
+                    pr = pr_data.get("pr", pr_data)
+                    pr_url = pr.get("html_url", "")
+                    pr_num = pr.get("number", "?")
+                    title = pr.get("title", "")[:50]
+                    all_pr_entries.append(f'    • <{pr_url}|PR #{pr_num}>: "{title}"')
+                    total_prs += 1
+            
             user_stats.append({
                 "Name": display_name,
-                "Total PRs": len(user_prs),
+                "Open PRs": len(user_prs),
                 "Inactive": inactive_count,
-                "Approved (not merged)": approved_count,
-                "Stale Drafts": stale_draft_count
+                "Approved": approved_count,
+                "Drafts": stale_draft_count,
+                "To Review": awaiting_count
             })
         
         consolidated_lines = [
             f"*Team PR Summary - {today}*",
             "",
-            f"There are *{total_prs}* PR(s) across *{len(prs_by_user)}* team members that need attention:",
+            f"There are *{total_prs}* PR(s) across *{len(all_users)}* team members that need attention:",
         ]
         consolidated_lines.extend(all_pr_entries)
         consolidated_lines.extend([
@@ -439,6 +475,125 @@ def display_closed_prs(prs):
     }).rename(columns={"Title": "PR Count"}).sort_values("Total Lines", ascending=False)
     st.bar_chart(author_stats["Total Lines"])
 
+def display_individual_stats_combined(all_repos, username, days_back, exclude_drafts=False, exclude_cherrypicks=False):
+    """Display combined Open PRs + Stats for a single selected user."""
+    config = load_config()
+    user_display_names = config.get("user_display_names", {})
+    display_name = user_display_names.get(username, username)
+    
+    with st.spinner("Fetching data..."):
+        open_prs = search_prs(all_repos, [username], state="open", days_back=days_back)
+        merged_prs = search_merged_prs(all_repos, [username], days_back)
+        
+        if exclude_drafts:
+            merged_prs = [pr for pr in merged_prs if not pr.get("draft", False)]
+        
+        user_merged = [pr for pr in merged_prs if pr.get("user", {}).get("login") == username]
+    
+    st.subheader(f"📊 Summary for {display_name}")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("🟢 Open PRs", len(open_prs))
+    with col2:
+        st.metric("🔀 PRs Merged", len(user_merged))
+    
+    st.divider()
+    
+    st.subheader("🟢 Open PRs")
+    display_open_prs(open_prs, exclude_cherrypicks, exclude_drafts)
+    
+    st.divider()
+    
+    st.subheader("👀 Review Responsibilities")
+    with st.spinner("Fetching review data..."):
+        prs_as_reviewer = search_prs_where_user_is_reviewer(all_repos, [username])
+        if exclude_drafts:
+            prs_as_reviewer = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in prs_as_reviewer.items()}
+        user_reviewing = prs_as_reviewer.get(username, [])
+    
+    if user_reviewing:
+        rows = []
+        now = datetime.utcnow()
+        review_sla_hours = 24
+        
+        pr_list = []
+        for pr in user_reviewing:
+            owner = pr.get("_owner", "")
+            repo = pr.get("_repo", "")
+            if not owner or not repo:
+                owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+            pr_number = pr.get("number")
+            if owner and repo and pr_number:
+                pr_list.append((owner, repo, pr_number))
+        
+        all_pr_data = get_multiple_prs_full_details(pr_list) if pr_list else {}
+        
+        for pr in user_reviewing:
+            owner = pr.get("_owner", "")
+            repo = pr.get("_repo", "")
+            if not owner or not repo:
+                owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+            pr_number = pr.get("number")
+            
+            pr_data = all_pr_data.get((owner, repo, pr_number), {})
+            reviews = pr_data.get("reviews", [])
+            issue_comments = pr_data.get("comments", [])
+            review_comments = pr_data.get("review_comments", [])
+            
+            created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
+            last_activity = get_last_activity_time(issue_comments, review_comments, reviews)
+            last_activity_dt = last_activity.replace(tzinfo=None) if last_activity else created_at.replace(tzinfo=None)
+            hours_since_activity = int((now - last_activity_dt).total_seconds() / 3600)
+            
+            user_has_reviewed = any(
+                r.get("user", {}).get("login", "").lower() == username.lower() 
+                for r in reviews
+            )
+            
+            if user_has_reviewed:
+                review_status = "✅ Reviewed"
+            elif hours_since_activity > review_sla_hours:
+                review_status = "🔴 Needs Review"
+            else:
+                review_status = "🟡 Pending"
+            
+            pr_title = pr.get("title", "")
+            pr_url = pr.get("html_url", "")
+            rows.append({
+                "Status": review_status,
+                "Repository": f"{owner}/{repo}",
+                "PR #": pr_url,
+                "Title": pr_title,
+                "Author": pr.get("user", {}).get("login", "Unknown"),
+                "Last Activity": last_activity_dt.strftime("%Y-%m-%d %H:%M"),
+                "Hours Idle": hours_since_activity
+            })
+        
+        df = pd.DataFrame(rows)
+        df = df.sort_values(by="Status", key=lambda x: x.map({"🔴 Needs Review": 0, "🟡 Pending": 1, "✅ Reviewed": 2}))
+        
+        def highlight_status(row):
+            if "Needs Review" in row["Status"]:
+                return ["background-color: rgba(239, 68, 68, 0.25)"] * len(row)
+            elif "Pending" in row["Status"]:
+                return ["background-color: rgba(234, 179, 8, 0.15)"] * len(row)
+            elif "Reviewed" in row["Status"]:
+                return ["background-color: rgba(34, 197, 94, 0.15)"] * len(row)
+            return [""] * len(row)
+        
+        styled_df = df.style.apply(highlight_status, axis=1)
+        st.dataframe(
+            styled_df,
+            column_config={
+                "PR #": st.column_config.LinkColumn("PR #", display_text="/(\\d+)$", width="small"),
+                "Hours Idle": st.column_config.NumberColumn(format="%d hrs")
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info(f"{display_name} is not currently listed as a reviewer on any open PRs.")
+
 def display_individual_stats(all_repos, username, days_back, exclude_drafts=False):
     """Display stats for a single selected user."""
     config = load_config()
@@ -448,55 +603,144 @@ def display_individual_stats(all_repos, username, days_back, exclude_drafts=Fals
     st.subheader(f"📊 Summary for {display_name}")
     with st.spinner("Fetching metrics..."):
         merged_prs = search_merged_prs(all_repos, [username], days_back)
-        reviewed_prs = search_reviewed_prs(all_repos, [username], days_back)
         awaiting_review = search_review_requested_prs(all_repos, [username])
         
         if exclude_drafts:
             merged_prs = [pr for pr in merged_prs if not pr.get("draft", False)]
-            reviewed_prs = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in reviewed_prs.items()}
             awaiting_review = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in awaiting_review.items()}
         
         user_merged = [pr for pr in merged_prs if pr.get("user", {}).get("login") == username]
-        user_reviewed = reviewed_prs.get(username, [])
         user_awaiting = awaiting_review.get(username, [])
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         st.metric("🔀 PRs Merged", len(user_merged))
     with col2:
-        st.metric("👀 PRs Reviewed", len(user_reviewed))
-    with col3:
         st.metric("⏳ Awaiting Their Review", len(user_awaiting))
     
-    if user_awaiting:
-        st.subheader(f"📋 PRs Awaiting Review from {display_name}")
-        rows = []
-        for pr in user_awaiting:
-            owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
-            created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
-            age_days = (datetime.utcnow() - created_at.replace(tzinfo=None)).days
-            pr_title = pr.get("title", "")
-            pr_url = pr.get("html_url", "")
-            rows.append({
-                "Repository": f"{owner}/{repo}",
-                "PR #": pr_url,
-                "Title": pr_title,
-                "Author": pr.get("user", {}).get("login", "Unknown"),
-                "Age (days)": age_days
-            })
+    tab1, tab2 = st.tabs(["📋 Awaiting Review", "🔍 Reviewing PRs"])
+    
+    with tab1:
+        if user_awaiting:
+            st.subheader(f"PRs Awaiting Review from {display_name}")
+            rows = []
+            for pr in user_awaiting:
+                owner = pr.get("_owner", "")
+                repo = pr.get("_repo", "")
+                if not owner or not repo:
+                    owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+                created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
+                age_days = (datetime.utcnow() - created_at.replace(tzinfo=None)).days
+                pr_title = pr.get("title", "")
+                pr_url = pr.get("html_url", "")
+                rows.append({
+                    "Repository": f"{owner}/{repo}",
+                    "PR #": pr_url,
+                    "Title": pr_title,
+                    "Author": pr.get("user", {}).get("login", "Unknown"),
+                    "Age (days)": age_days
+                })
+            
+            df = pd.DataFrame(rows)
+            st.dataframe(
+                df,
+                column_config={
+                    "PR #": st.column_config.LinkColumn("PR #", display_text="/(\\d+)$", width="small"),
+                    "Age (days)": st.column_config.NumberColumn(format="%d days")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info(f"No PRs currently awaiting review from {display_name}.")
+    
+    with tab2:
+        with st.spinner("Fetching review data..."):
+            prs_as_reviewer = search_prs_where_user_is_reviewer(all_repos, [username])
+            if exclude_drafts:
+                prs_as_reviewer = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in prs_as_reviewer.items()}
+            user_reviewing = prs_as_reviewer.get(username, [])
         
-        df = pd.DataFrame(rows)
-        st.dataframe(
-            df,
-            column_config={
-                "PR #": st.column_config.LinkColumn("PR #", display_text="/(\\d+)$", width="small"),
-                "Age (days)": st.column_config.NumberColumn(format="%d days")
-            },
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.info(f"No PRs currently awaiting review from {display_name}.")
+        if user_reviewing:
+            st.subheader(f"PRs {display_name} is Reviewing")
+            rows = []
+            now = datetime.utcnow()
+            review_sla_hours = 24
+            
+            pr_list = []
+            for pr in user_reviewing:
+                owner = pr.get("_owner", "")
+                repo = pr.get("_repo", "")
+                if not owner or not repo:
+                    owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+                pr_number = pr.get("number")
+                if owner and repo and pr_number:
+                    pr_list.append((owner, repo, pr_number))
+            
+            all_pr_data = get_multiple_prs_full_details(pr_list) if pr_list else {}
+            
+            for pr in user_reviewing:
+                owner = pr.get("_owner", "")
+                repo = pr.get("_repo", "")
+                if not owner or not repo:
+                    owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+                pr_number = pr.get("number")
+                
+                pr_data = all_pr_data.get((owner, repo, pr_number), {})
+                reviews = pr_data.get("reviews", [])
+                issue_comments = pr_data.get("comments", [])
+                review_comments = pr_data.get("review_comments", [])
+                
+                created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
+                last_activity = get_last_activity_time(issue_comments, review_comments, reviews)
+                last_activity_dt = last_activity.replace(tzinfo=None) if last_activity else created_at.replace(tzinfo=None)
+                hours_since_activity = int((now - last_activity_dt).total_seconds() / 3600)
+                
+                user_has_reviewed = any(
+                    r.get("user", {}).get("login", "").lower() == username.lower() 
+                    for r in reviews
+                )
+                
+                if user_has_reviewed:
+                    sla_status = "✅ Reviewed"
+                elif hours_since_activity > review_sla_hours:
+                    sla_status = "🔴 SLA Violation"
+                else:
+                    sla_status = "🟢 On Track"
+                
+                pr_title = pr.get("title", "")
+                pr_url = pr.get("html_url", "")
+                rows.append({
+                    "SLA Status": sla_status,
+                    "Repository": f"{owner}/{repo}",
+                    "PR #": pr_url,
+                    "Title": pr_title,
+                    "Author": pr.get("user", {}).get("login", "Unknown"),
+                    "Last Activity": last_activity_dt.strftime("%Y-%m-%d %H:%M"),
+                    "Hours Inactive": hours_since_activity
+                })
+            
+            df = pd.DataFrame(rows)
+            
+            def highlight_sla(row):
+                if "SLA Violation" in row["SLA Status"]:
+                    return ["background-color: rgba(239, 68, 68, 0.25)"] * len(row)
+                elif "Reviewed" in row["SLA Status"]:
+                    return ["background-color: rgba(34, 197, 94, 0.15)"] * len(row)
+                return [""] * len(row)
+            
+            styled_df = df.style.apply(highlight_sla, axis=1)
+            st.dataframe(
+                styled_df,
+                column_config={
+                    "PR #": st.column_config.LinkColumn("PR #", display_text="/(\\d+)$", width="small"),
+                    "Hours Inactive": st.column_config.NumberColumn(format="%d hrs")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info(f"{display_name} is not currently listed as a reviewer on any open PRs.")
 
 def display_team_stats(all_repos, selected_users, days_back, exclude_drafts=False):
     config = load_config()
@@ -573,13 +817,7 @@ if pr_state == "Open":
         with tab_stats:
             display_team_stats(all_repos, selected_users, days_back, exclude_drafts)
     elif len(selected_users) == 1:
-        tab_prs, tab_stats = st.tabs(["🟢 Open Pull Requests", "📊 Individual Stats"])
-        with tab_prs:
-            with st.spinner("Fetching open PRs..."):
-                open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
-            display_open_prs(open_prs, exclude_cherrypicks, exclude_drafts)
-        with tab_stats:
-            display_individual_stats(all_repos, selected_users[0], days_back, exclude_drafts)
+        display_individual_stats_combined(all_repos, selected_users[0], days_back, exclude_drafts, exclude_cherrypicks)
     else:
         tab_prs, tab_stats = st.tabs(["🟢 Open Pull Requests", "📊 Selected Members Stats"])
         with tab_prs:
@@ -598,26 +836,46 @@ elif pr_state == "Closed":
 else:
     if select_all_users:
         tab_open, tab_closed, tab_stats = st.tabs(["🟢 Open PRs", "🔴 Closed PRs", "📊 Team Stats"])
+        
+        with tab_open:
+            with st.spinner("Fetching open PRs..."):
+                open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
+            display_open_prs(open_prs, exclude_cherrypicks, exclude_drafts)
+        
+        with tab_stats:
+            display_team_stats(all_repos, selected_users, days_back, exclude_drafts)
+        
+        with tab_closed:
+            with st.spinner("Fetching closed PRs..."):
+                closed_prs = search_prs(all_repos, selected_users, state="closed", days_back=days_back)
+            display_closed_prs(closed_prs)
+    
     elif len(selected_users) == 1:
-        tab_open, tab_closed, tab_stats = st.tabs(["🟢 Open PRs", "🔴 Closed PRs", "📊 Individual Stats"])
+        tab_combined, tab_closed = st.tabs(["📊 PR Dashboard", "🔴 Closed PRs"])
+        
+        with tab_combined:
+            display_individual_stats_combined(all_repos, selected_users[0], days_back, exclude_drafts, exclude_cherrypicks)
+        
+        with tab_closed:
+            with st.spinner("Fetching closed PRs..."):
+                closed_prs = search_prs(all_repos, selected_users, state="closed", days_back=days_back)
+            display_closed_prs(closed_prs)
+    
     else:
         tab_open, tab_closed, tab_stats = st.tabs(["🟢 Open PRs", "🔴 Closed PRs", "📊 Selected Members Stats"])
-    
-    with tab_open:
-        with st.spinner("Fetching open PRs..."):
-            open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
-        display_open_prs(open_prs, exclude_cherrypicks, exclude_drafts)
-    
-    with tab_stats:
-        if len(selected_users) == 1:
-            display_individual_stats(all_repos, selected_users[0], days_back, exclude_drafts)
-        else:
+        
+        with tab_open:
+            with st.spinner("Fetching open PRs..."):
+                open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
+            display_open_prs(open_prs, exclude_cherrypicks, exclude_drafts)
+        
+        with tab_stats:
             display_team_stats(all_repos, selected_users, days_back, exclude_drafts)
-    
-    with tab_closed:
-        with st.spinner("Fetching closed PRs..."):
-            closed_prs = search_prs(all_repos, selected_users, state="closed", days_back=days_back)
-        display_closed_prs(closed_prs)
+        
+        with tab_closed:
+            with st.spinner("Fetching closed PRs..."):
+                closed_prs = search_prs(all_repos, selected_users, state="closed", days_back=days_back)
+            display_closed_prs(closed_prs)
 
 st.divider()
 st.header("🔔 Slack Reminders Configuration")
@@ -819,11 +1077,54 @@ with st.expander("Preview & Send Reminders", expanded=False):
             st.warning("No PR data available. Please wait for the table to load.")
         else:
             fresh_config = load_config()
+            awaiting_by_user = {}
+            with st.spinner("Fetching reviewer data..."):
+                awaiting_prs = search_review_requested_prs(all_repos, selected_users)
+                for username, prs in awaiting_prs.items():
+                    if prs:
+                        pr_list = []
+                        for pr in prs:
+                            owner = pr.get("_owner", "")
+                            repo = pr.get("_repo", "")
+                            if not owner or not repo:
+                                owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+                            pr_number = pr.get("number")
+                            if owner and repo and pr_number:
+                                pr_list.append((owner, repo, pr_number))
+                        
+                        all_pr_data = get_multiple_prs_full_details(pr_list) if pr_list else {}
+                        
+                        pr_data_list = []
+                        for pr in prs:
+                            owner = pr.get("_owner", "")
+                            repo = pr.get("_repo", "")
+                            if not owner or not repo:
+                                owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+                            pr_number = pr.get("number")
+                            
+                            pr_details = all_pr_data.get((owner, repo, pr_number), {})
+                            reviews = pr_details.get("reviews", [])
+                            
+                            user_has_reviewed = any(
+                                r.get("user", {}).get("login", "").lower() == username.lower()
+                                for r in reviews
+                            )
+                            
+                            if user_has_reviewed:
+                                continue
+                            
+                            created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+                            hours_waiting = (datetime.utcnow() - created_at).total_seconds() / 3600
+                            pr_data_list.append({"pr": pr, "hours_waiting": hours_waiting})
+                        
+                        if pr_data_list:
+                            awaiting_by_user[username] = pr_data_list
             st.session_state.preview_messages = generate_preview_from_table_rows(
                 table_rows,
                 fresh_config.get("user_display_names", {}),
                 fresh_config.get("user_slack_mapping", {}),
-                consolidated=show_consolidated_option
+                consolidated=show_consolidated_option,
+                awaiting_review_by_user=awaiting_by_user
             )
             if not st.session_state.preview_messages:
                 st.info("No PRs need attention - no reminders to send.")

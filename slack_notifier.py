@@ -3,7 +3,7 @@ import json
 import requests
 from datetime import datetime, timedelta
 import pytz
-from github_api import search_prs, get_pr_reviews, get_pr_comments, get_pr_review_comments, get_pr_details, parse_repo_from_url, get_first_approval_time, get_last_comment_time, get_last_activity_time
+from github_api import search_prs, get_pr_reviews, get_pr_comments, get_pr_review_comments, get_pr_details, parse_repo_from_url, get_first_approval_time, get_last_comment_time, get_last_activity_time, search_review_requested_prs, get_multiple_prs_full_details
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "slack_config.json")
 
@@ -288,8 +288,9 @@ def find_approved_not_merged(repos: list, username: str, days_threshold: int = 1
     
     return approved_pending
 
-def format_reminder_message(username: str, stale_prs: list, approved_prs: list, stale_drafts: list, display_name: str = None) -> str:
-    total = len(stale_prs) + len(approved_prs) + len(stale_drafts)
+def format_reminder_message(username: str, stale_prs: list, approved_prs: list, stale_drafts: list, awaiting_your_review: list = None, display_name: str = None) -> str:
+    awaiting_your_review = awaiting_your_review or []
+    total = len(stale_prs) + len(approved_prs) + len(stale_drafts) + len(awaiting_your_review)
     if total == 0:
         return ""
     
@@ -297,37 +298,51 @@ def format_reminder_message(username: str, stale_prs: list, approved_prs: list, 
     lines = [f"*PR Reminder* - {datetime.now().strftime('%b %d, %Y')}\n"]
     lines.append(f"Hi {greeting_name}! You have *{total}* PR(s) that need attention:\n")
     
-    if stale_prs:
-        lines.append("*⏰ No Recent Activity:*")
-        for item in stale_prs:
-            pr = item["pr"]
-            hours = item["hours_inactive"]
-            base = item.get("base_branch", "")
-            base_str = f" → `{base}`" if base else ""
-            time_str = f"{hours // 24}d {hours % 24}h" if hours >= 24 else f"{hours}h"
-            lines.append(f"  • <{pr['html_url']}|PR #{pr['number']}>{base_str}: \"{pr['title'][:50]}\" - Inactive for {time_str}")
+    open_prs_count = len(stale_prs) + len(approved_prs) + len(stale_drafts)
+    if open_prs_count > 0:
+        lines.append("*📂 Your Open PRs:*")
+        
+        if stale_prs:
+            lines.append("\n  _⏰ Inactive:_")
+            for item in stale_prs:
+                pr = item["pr"]
+                hours = item["hours_inactive"]
+                base = item.get("base_branch", "")
+                base_str = f" → `{base}`" if base else ""
+                time_str = f"{int(hours // 24)}d {int(hours % 24)}h" if hours >= 24 else f"{int(hours)}h"
+                lines.append(f"    • <{pr['html_url']}|PR #{pr['number']}>{base_str}: \"{pr['title'][:50]}\" - {time_str}")
+        
+        if approved_prs:
+            lines.append("\n  _✅ Approved - Awaiting Merge:_")
+            for item in approved_prs:
+                pr = item["pr"]
+                base = item.get("base_branch", "")
+                base_str = f" → `{base}`" if base else ""
+                lines.append(f"    • <{pr['html_url']}|PR #{pr['number']}>{base_str}: \"{pr['title'][:50]}\" - {item['days_since_approval']}d ago")
+        
+        if stale_drafts:
+            lines.append("\n  _📝 Stale Drafts:_")
+            for item in stale_drafts:
+                pr = item["pr"]
+                base = item.get("base_branch", "")
+                base_str = f" → `{base}`" if base else ""
+                lines.append(f"    • <{pr['html_url']}|PR #{pr['number']}>{base_str}: \"{pr['title'][:50]}\" - Draft for {item['days_as_draft']}d")
     
-    if stale_drafts:
-        lines.append("\n*📝 Stale Drafts:*")
-        for item in stale_drafts:
+    if awaiting_your_review:
+        lines.append("\n*👀 PRs Awaiting Your Review:*")
+        for item in awaiting_your_review:
             pr = item["pr"]
-            base = item.get("base_branch", "")
-            base_str = f" → `{base}`" if base else ""
-            lines.append(f"  • <{pr['html_url']}|PR #{pr['number']}>{base_str}: \"{pr['title'][:50]}\" - Draft for {item['days_as_draft']} days")
-    
-    if approved_prs:
-        lines.append("\n*✅ Approved - Awaiting Merge:*")
-        for item in approved_prs:
-            pr = item["pr"]
-            base = item.get("base_branch", "")
-            base_str = f" → `{base}`" if base else ""
-            lines.append(f"  • <{pr['html_url']}|PR #{pr['number']}>{base_str}: \"{pr['title'][:50]}\" - Approved {item['days_since_approval']} days ago")
+            hours = item.get("hours_waiting", 0)
+            author = item.get("author", "Unknown")
+            sla_indicator = "🔴" if hours >= 24 else "🟢"
+            time_str = f"{int(hours // 24)}d {int(hours % 24)}h" if hours >= 24 else f"{int(hours)}h"
+            lines.append(f"  • {sla_indicator} <{pr['html_url']}|PR #{pr['number']}>: \"{pr['title'][:50]}\" by {author} - {time_str}")
     
     lines.append("\n---")
-    lines.append("Please take a moment to review these PRs. If any are stalled, I'd like to understand the blockers so I can help move them forward. Is the inactivity due to:")
+    lines.append("Please take a moment to review these PRs. If any are stalled, we would like to understand the blockers so I can help move them forward. Is the inactivity due to:")
     lines.append("a) Pending reviews (stakeholders or area-experts)?")
     lines.append("b) Technical hurdles or shifting priorities?")
-    lines.append("\nLet me know where I can step in to clear the path or nudge the right/concerned folks.")
+    lines.append("Let me know where we can step in to clear the path or nudge the right/concerned folks.")
     
     return "\n".join(lines)
 
@@ -346,13 +361,59 @@ def send_reminders(repos: list, usernames: list, config: dict = None, dry_run: b
     user_display_names = config.get("user_display_names") or get_user_display_names()
     results = []
     
+    awaiting_review_all = search_review_requested_prs(repos, usernames)
+    
     for username in usernames:
         stale = find_stale_prs(repos, username, hours_last_activity, exclude_drafts, days_back, exclude_cherrypicks)
         stale_drafts = [] if exclude_drafts else find_stale_drafts(repos, username, days_draft_stale, days_back, exclude_cherrypicks)
         approved = find_approved_not_merged(repos, username, days_approved_not_merged, exclude_drafts, days_back, exclude_cherrypicks)
         
+        awaiting_review_prs = awaiting_review_all.get(username, [])
+        if exclude_drafts:
+            awaiting_review_prs = [pr for pr in awaiting_review_prs if not pr.get("draft", False)]
+        
+        pr_list = []
+        for pr in awaiting_review_prs:
+            owner = pr.get("_owner", "")
+            repo = pr.get("_repo", "")
+            if not owner or not repo:
+                owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+            pr_number = pr.get("number")
+            if owner and repo and pr_number:
+                pr_list.append((owner, repo, pr_number))
+        
+        all_pr_data = get_multiple_prs_full_details(pr_list) if pr_list else {}
+        
+        awaiting_review_items = []
+        now = datetime.utcnow()
+        for pr in awaiting_review_prs:
+            owner = pr.get("_owner", "")
+            repo = pr.get("_repo", "")
+            if not owner or not repo:
+                owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+            pr_number = pr.get("number")
+            
+            pr_details = all_pr_data.get((owner, repo, pr_number), {})
+            reviews = pr_details.get("reviews", [])
+            
+            user_has_reviewed = any(
+                r.get("user", {}).get("login", "").lower() == username.lower()
+                for r in reviews
+            )
+            
+            if user_has_reviewed:
+                continue
+            
+            created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+            hours_waiting = int((now - created_at).total_seconds() / 3600)
+            awaiting_review_items.append({
+                "pr": pr,
+                "hours_waiting": hours_waiting,
+                "author": pr.get("user", {}).get("login", "Unknown")
+            })
+        
         display_name = user_display_names.get(username)
-        message = format_reminder_message(username, stale, approved, stale_drafts, display_name)
+        message = format_reminder_message(username, stale, approved, stale_drafts, awaiting_review_items, display_name)
         
         if not message:
             results.append({"user": username, "status": "no_prs", "message": ""})
