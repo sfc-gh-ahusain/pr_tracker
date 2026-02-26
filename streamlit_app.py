@@ -53,6 +53,31 @@ with st.sidebar:
     st.divider()
     st.subheader("🎯 Filters")
     
+    days_back = st.slider("Days to look back", 7, 365, 15)
+    
+    with st.container():
+        st.markdown("**⏰ Inactivity Thresholds**")
+        col_thresh1, col_thresh2 = st.columns(2)
+        with col_thresh1:
+            inactive_open_prs_days = st.number_input(
+                "Open PRs (days)",
+                min_value=1,
+                max_value=30,
+                value=1,
+                help="PRs with no activity for this many days are flagged as inactive"
+            )
+        with col_thresh2:
+            inactive_awaiting_review_days = st.number_input(
+                "Awaiting Review (days)",
+                min_value=1,
+                max_value=30,
+                value=1,
+                help="PRs awaiting review for this many days are flagged"
+            )
+    
+    inactive_open_prs_hours = inactive_open_prs_days * 24
+    inactive_awaiting_review_hours = inactive_awaiting_review_days * 24
+    
     select_all = st.checkbox("Select All Team Members", value=False)
     
     if select_all:
@@ -79,8 +104,6 @@ with st.sidebar:
         options=["Open", "Closed", "Both"],
         horizontal=True
     )
-    
-    days_back = st.slider("Days to look back", 7, 365, 15)
     
     exclude_cherrypicks = st.checkbox(
         "Exclude Cherry-Pick PRs",
@@ -205,8 +228,8 @@ def generate_preview_from_table_rows(rows, user_display_names, user_slack_mappin
                 title = pr.get("title", "")[:50]
                 author = pr.get("user", {}).get("login", "unknown")
                 hours = pr_data.get("hours_waiting", 0)
-                sla = "🔴" if hours >= 24 else "🟢"
-                time_str = f"{int(hours // 24)}d {int(hours % 24)}h" if hours >= 24 else f"{int(hours)}h"
+                sla = "🔴" if hours >= inactive_awaiting_review_hours else "🟢"
+                time_str = f"{int(hours // 24)}d {int(hours % 24)}h" if hours >= inactive_awaiting_review_hours else f"{int(hours)}h"
                 lines.append(f'  • {sla} <{pr_url}|PR #{pr_num}>: "{title}" by {author} - {time_str}')
         
         lines.append("")
@@ -357,7 +380,7 @@ def display_open_prs(prs, exclude_cherrypicks=False, exclude_drafts=False):
         hours_inactive = int((now - last_activity_dt).total_seconds() / 3600)
         
         attention_reasons = []
-        if hours_inactive >= 24:
+        if hours_inactive >= inactive_open_prs_hours:
             attention_reasons.append(f"⏰ {hours_inactive}h inactive")
         if first_approval and (now - first_approval.replace(tzinfo=None)).days >= 1:
             attention_reasons.append("✅ Approved, not merged")
@@ -514,7 +537,7 @@ def display_individual_stats_combined(all_repos, username, days_back, exclude_dr
     if user_reviewing:
         rows = []
         now = datetime.utcnow()
-        review_sla_hours = 24
+        review_sla_hours = inactive_awaiting_review_hours
         
         pr_list = []
         for pr in user_reviewing:
@@ -593,6 +616,76 @@ def display_individual_stats_combined(all_repos, username, days_back, exclude_dr
         )
     else:
         st.info(f"{display_name} is not currently listed as a reviewer on any open PRs.")
+    
+    st.divider()
+    st.subheader("📤 Send Slack Reminder")
+    
+    token = config.get("slack_bot_token", "")
+    token_valid = token and token != "xoxb-YOUR-BOT-TOKEN-HERE"
+    my_slack_id = config.get("my_slack_id", "")
+    user_slack_mapping = config.get("user_slack_mapping", {})
+    slack_id = user_slack_mapping.get(username, "")
+    slack_configured = slack_id and slack_id != "NOT MAPPED" and slack_id != "U_SLACK_ID_HERE"
+    
+    github_slack_users = {k: v for k, v in user_slack_mapping.items() if v}
+    additional_contacts = config.get("additional_slack_contacts", {})
+    cc_options_map = {}
+    for gh_user, sid in github_slack_users.items():
+        disp = user_display_names.get(gh_user) or gh_user
+        cc_options_map[disp] = {"type": "github", "github": gh_user, "slack_id": sid}
+    for name, sid in additional_contacts.items():
+        cc_options_map[f"📋 {name}"] = {"type": "additional", "slack_id": sid}
+    
+    awaiting_review = search_review_requested_prs(all_repos, [username])
+    user_awaiting = awaiting_review.get(username, [])
+    
+    lines = [f"Hi {display_name}! 👋", ""]
+    if open_prs:
+        lines.append(f"📂 *You have {len(open_prs)} open PR(s):*")
+        for pr in open_prs:
+            pr_num = pr.get("number", "?")
+            pr_url = pr.get("html_url", "")
+            title = pr.get("title", "Untitled")
+            lines.append(f"  • <{pr_url}|PR #{pr_num}>: \"{title}\"")
+        lines.append("")
+    if user_awaiting:
+        lines.append(f"👀 *{len(user_awaiting)} PR(s) awaiting your review:*")
+        for pr in user_awaiting:
+            pr_num = pr.get("number", "?")
+            pr_url = pr.get("html_url", "")
+            title = pr.get("title", "Untitled")
+            author = pr.get("user", {}).get("login", "Unknown")
+            lines.append(f'  • <{pr_url}|PR #{pr_num}>: "{title}" by {author}')
+    lines.extend(["", "---", "Please take a moment to review these PRs. If any are stalled, we would like to understand the blockers so I can help move them forward. Is the inactivity due to:", "a) Pending reviews (stakeholders or area-experts)?", "b) Technical hurdles or shifting priorities?", "Let me know where we can step in to clear the path or nudge the right/concerned folks."])
+    default_message = "\n".join(lines)
+    
+    edited_msg = st.text_area("Message:", value=default_message, height=200, key=f"indiv_msg_{username}")
+    
+    other_cc_options = [opt for opt in cc_options_map.keys() if cc_options_map.get(opt, {}).get("github") != username]
+    col_cc1, col_cc2 = st.columns([1, 3])
+    with col_cc1:
+        cc_myself = st.checkbox("CC myself", value=True, key=f"indiv_cc_{username}")
+    with col_cc2:
+        cc_additional = st.multiselect("CC additional", options=other_cc_options, default=[], key=f"indiv_cc_add_{username}")
+    
+    send_disabled = not token_valid or not slack_configured
+    btn_label = "📤 Send Reminder" if slack_configured else "📤 Send (No Slack ID)"
+    if st.button(btn_label, key=f"indiv_send_{username}", disabled=send_disabled, use_container_width=True):
+        from slack_notifier import send_slack_dm
+        success, result = send_slack_dm(token, slack_id, edited_msg)
+        if success:
+            st.success(f"✅ Sent to {display_name}")
+            if cc_myself and my_slack_id:
+                cc_msg = f"[CC - sent to {display_name}]\n\n{edited_msg}"
+                send_slack_dm(token, my_slack_id, cc_msg)
+            for cc_name in cc_additional:
+                cc_info = cc_options_map.get(cc_name, {})
+                cc_slack_id = cc_info.get("slack_id", "")
+                if cc_slack_id:
+                    cc_msg = f"[CC - sent to {display_name}]\n\n{edited_msg}"
+                    send_slack_dm(token, cc_slack_id, cc_msg)
+        else:
+            st.error(f"Failed: {result}")
 
 def display_individual_stats(all_repos, username, days_back, exclude_drafts=False):
     """Display stats for a single selected user."""
@@ -665,7 +758,7 @@ def display_individual_stats(all_repos, username, days_back, exclude_drafts=Fals
             st.subheader(f"PRs {display_name} is Reviewing")
             rows = []
             now = datetime.utcnow()
-            review_sla_hours = 24
+            review_sla_hours = inactive_awaiting_review_hours
             
             pr_list = []
             for pr in user_reviewing:
@@ -770,40 +863,230 @@ def display_team_stats(all_repos, selected_users, days_back, exclude_drafts=Fals
         st.metric("⏳ PRs Awaiting Review", total_awaiting)
     
     st.subheader("👥 Team PR Activity")
-    
+
     reviewer_data = []
     for username in selected_users:
         display_name = user_display_names.get(username, username)
         prs_reviewed = reviewed_prs.get(username, [])
         prs_awaiting = awaiting_review.get(username, [])
         prs_merged_by_user = [pr for pr in merged_prs if pr.get("user", {}).get("login") == username]
-        
+
         reviewer_data.append({
             "Name": display_name,
             "PRs Merged": len(prs_merged_by_user),
             "PRs Reviewed": len(prs_reviewed),
             "Awaiting Their Review": len(prs_awaiting)
         })
-    
+
     df_reviewer = pd.DataFrame(reviewer_data)
-    html_reviewer = df_reviewer.to_html(index=False, escape=False)
-    html_reviewer = html_reviewer.replace('<thead>', '''<thead style="background-color: #4b5563;">''')
-    html_reviewer = html_reviewer.replace('<th>', '''<th style="font-weight: 700; font-size: 15px; color: white; padding: 12px 16px; text-align: left;">''')
-    html_reviewer = html_reviewer.replace('<table ', '''<table style="width: 100%; border-collapse: collapse;" ''')
-    html_reviewer = html_reviewer.replace('<td>', '''<td style="padding: 10px 16px; border-bottom: 1px solid #e5e7eb;">''')
-    st.markdown(html_reviewer, unsafe_allow_html=True)
-    
-    st.subheader("📋 PRs Awaiting Review Details")
+
+    view_mode = st.radio("View", ["Bar Chart", "Table"], horizontal=True, key="team_pr_view")
+
+    if view_mode == "Bar Chart":
+        import altair as alt
+        chart_df = df_reviewer.melt(id_vars=["Name"], var_name="Metric", value_name="Count")
+        chart = alt.Chart(chart_df).mark_bar().encode(
+            y=alt.Y("Name:N", sort=None, title=None, axis=alt.Axis(labelFontSize=14, labelFontWeight="bold")),
+            x=alt.X("Count:Q", title="PRs"),
+            color=alt.Color("Metric:N", legend=alt.Legend(orient="top")),
+            yOffset="Metric:N"
+        ).properties(height=max(80 * len(selected_users), 200))
+        st.altair_chart(chart, use_container_width=True)
+    else:
+        html_reviewer = df_reviewer.to_html(index=False, escape=False)
+        html_reviewer = html_reviewer.replace('<thead>', '''<thead style="background-color: #4b5563;">''')
+        html_reviewer = html_reviewer.replace('<th>', '''<th style="font-weight: 700; font-size: 15px; color: white; padding: 12px 16px; text-align: left;">''')
+        html_reviewer = html_reviewer.replace('<table ', '''<table style="width: 100%; border-collapse: collapse;" ''')
+        html_reviewer = html_reviewer.replace('<td>', '''<td style="padding: 10px 16px; border-bottom: 1px solid #e5e7eb;">''')
+        st.markdown(html_reviewer, unsafe_allow_html=True)
+
+    st.subheader("👤 Per-Member Details & Reminders")
+
+    token = config.get("slack_bot_token", "")
+    token_valid = token and token != "xoxb-YOUR-BOT-TOKEN-HERE"
+    my_slack_id = config.get("my_slack_id", "")
+    user_slack_mapping = config.get("user_slack_mapping", {})
+
+    github_slack_users = {k: v for k, v in user_slack_mapping.items() if v}
+    additional_contacts = config.get("additional_slack_contacts", {})
+    cc_options_map = {}
+    for gh_user, sid in github_slack_users.items():
+        disp = user_display_names.get(gh_user) or gh_user
+        cc_options_map[disp] = {"type": "github", "github": gh_user, "slack_id": sid}
+    for name, sid in additional_contacts.items():
+        cc_options_map[f"📋 {name}"] = {"type": "additional", "slack_id": sid}
+    all_cc_options = list(cc_options_map.keys())
+
+    open_prs_by_user = {}
+    open_prs_attention = {}
+    now = datetime.utcnow()
+    with st.spinner("Fetching open PRs..."):
+        all_open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
+        if exclude_drafts:
+            all_open_prs = [pr for pr in all_open_prs if not pr.get("draft", False)]
+        
+        pr_keys = []
+        for pr in all_open_prs:
+            owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+            pr_number = pr.get("number")
+            if owner and repo:
+                pr_keys.append((owner, repo, pr_number))
+        all_pr_details = get_multiple_prs_full_details(pr_keys) if pr_keys else {}
+        
+        for pr in all_open_prs:
+            author = pr.get("user", {}).get("login", "")
+            if author in selected_users:
+                if author not in open_prs_by_user:
+                    open_prs_by_user[author] = []
+                    open_prs_attention[author] = []
+                
+                owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+                pr_number = pr.get("number")
+                pr_data = all_pr_details.get((owner, repo, pr_number), {})
+                reviews = pr_data.get("reviews", [])
+                issue_comments = pr_data.get("comments", [])
+                review_comments = pr_data.get("review_comments", [])
+                
+                created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
+                last_activity = get_last_activity_time(issue_comments, review_comments, reviews)
+                last_activity_dt = last_activity.replace(tzinfo=None) if last_activity else created_at.replace(tzinfo=None)
+                hours_inactive = int((now - last_activity_dt).total_seconds() / 3600)
+                
+                needs_attention = hours_inactive >= inactive_open_prs_hours
+                pr["_needs_attention"] = needs_attention
+                pr["_hours_inactive"] = hours_inactive
+                
+                open_prs_by_user[author].append(pr)
+                if needs_attention:
+                    open_prs_attention[author].append(pr)
+
+    awaiting_review_attention = {}
+    with st.spinner("Fetching awaiting review details..."):
+        all_awaiting_prs = []
+        for user, prs in awaiting_review.items():
+            all_awaiting_prs.extend(prs)
+        
+        awaiting_pr_keys = []
+        for pr in all_awaiting_prs:
+            owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+            pr_number = pr.get("number")
+            if owner and repo:
+                awaiting_pr_keys.append((owner, repo, pr_number))
+        awaiting_pr_details = get_multiple_prs_full_details(awaiting_pr_keys) if awaiting_pr_keys else {}
+        
+        for user, prs in awaiting_review.items():
+            awaiting_review_attention[user] = []
+            for pr in prs:
+                owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
+                pr_number = pr.get("number")
+                pr_data = awaiting_pr_details.get((owner, repo, pr_number), {})
+                reviews = pr_data.get("reviews", [])
+                issue_comments = pr_data.get("comments", [])
+                review_comments = pr_data.get("review_comments", [])
+                
+                created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
+                last_activity = get_last_activity_time(issue_comments, review_comments, reviews)
+                last_activity_dt = last_activity.replace(tzinfo=None) if last_activity else created_at.replace(tzinfo=None)
+                hours_inactive = int((now - last_activity_dt).total_seconds() / 3600)
+                
+                needs_attention = hours_inactive >= inactive_open_prs_hours
+                pr["_needs_attention"] = needs_attention
+                pr["_hours_inactive"] = hours_inactive
+                if needs_attention:
+                    awaiting_review_attention[user].append(pr)
+
     for username in selected_users:
-        prs_awaiting = awaiting_review.get(username, [])
-        if prs_awaiting:
-            display_name = user_display_names.get(username, username)
-            with st.expander(f"{display_name} ({len(prs_awaiting)} PRs awaiting review)"):
-                for pr in prs_awaiting:
-                    title = pr.get("title", "")[:60] + ("..." if len(pr.get("title", "")) > 60 else "")
+        display_name = user_display_names.get(username, username)
+        slack_id = user_slack_mapping.get(username, "")
+        slack_configured = slack_id and slack_id != "NOT MAPPED" and slack_id != "U_SLACK_ID_HERE"
+
+        user_open_prs = open_prs_by_user.get(username, [])
+        user_attention_prs = open_prs_attention.get(username, [])
+        user_awaiting = awaiting_review.get(username, [])
+
+        attention_count = len(user_attention_prs)
+
+        with st.expander(f"**{display_name}** — {len(user_open_prs)} Open PRs, {len(user_awaiting)} Awaiting Review"):
+            col_open, col_awaiting = st.columns(2)
+            with col_open:
+                st.markdown(f"**🟢 Open PRs:** ({len(user_open_prs)} total, {attention_count} need attention)")
+                if user_open_prs:
+                    for pr in user_open_prs:
+                        title = pr.get("title", "")[:50] + ("..." if len(pr.get("title", "")) > 50 else "")
+                        pr_url = pr.get("html_url", "")
+                        needs_attn = pr.get("_needs_attention", False)
+                        icon = "⚠️" if needs_attn else "✓"
+                        st.markdown(f"{icon} [{pr.get('number')}]({pr_url}) - {title}")
+                else:
+                    st.caption("No open PRs")
+            with col_awaiting:
+                awaiting_attn_count = len(awaiting_review_attention.get(username, []))
+                st.markdown(f"**⏳ Awaiting Their Review:** ({len(user_awaiting)} total, {awaiting_attn_count} need attention)")
+                if user_awaiting:
+                    for pr in user_awaiting:
+                        title = pr.get("title", "")[:50] + ("..." if len(pr.get("title", "")) > 50 else "")
+                        pr_url = pr.get("html_url", "")
+                        author = pr.get("user", {}).get("login", "Unknown")
+                        needs_attn = pr.get("_needs_attention", False)
+                        icon = "⚠️" if needs_attn else "✓"
+                        st.markdown(f"{icon} [{pr.get('number')}]({pr_url}) - {title} (by {author})")
+                else:
+                    st.caption("No PRs awaiting review")
+
+            st.divider()
+            st.markdown("**📤 Send Reminder**")
+
+            lines = [f"Hi {display_name}! 👋", ""]
+            if user_attention_prs:
+                lines.append(f"🔴 *You have {len(user_attention_prs)} PR(s) needing attention:*")
+                for pr in user_attention_prs:
+                    pr_num = pr.get("number", "?")
                     pr_url = pr.get("html_url", "")
+                    title = pr.get("title", "Untitled")
+                    hours = pr.get("_hours_inactive", 0)
+                    time_str = f"{hours // 24}d {hours % 24}h" if hours >= 24 else f"{hours}h"
+                    lines.append(f"  • <{pr_url}|PR #{pr_num}>: \"{title}\" ({time_str} inactive)")
+                lines.append("")
+            if user_awaiting:
+                lines.append(f"👀 *{len(user_awaiting)} PR(s) awaiting your review:*")
+                for pr in user_awaiting:
+                    pr_num = pr.get("number", "?")
+                    pr_url = pr.get("html_url", "")
+                    title = pr.get("title", "Untitled")
                     author = pr.get("user", {}).get("login", "Unknown")
-                    st.markdown(f"• [{pr.get('number')}]({pr_url}) - {title} (by {author})")
+                    lines.append(f'  • <{pr_url}|PR #{pr_num}>: "{title}" by {author}')
+            if not user_attention_prs and not user_awaiting:
+                lines.append("✅ No PRs currently need your attention. Great work!")
+            lines.extend(["", "---", "Please take a moment to review these PRs. If any are stalled, we would like to understand the blockers so I can help move them forward. Is the inactivity due to:", "a) Pending reviews (stakeholders or area-experts)?", "b) Technical hurdles or shifting priorities?", "Let me know where we can step in to clear the path or nudge the right/concerned folks."])
+            default_message = "\n".join(lines)
+
+            edited_msg = st.text_area("Message:", value=default_message, height=200, key=f"team_msg_{username}")
+
+            other_cc_options = [opt for opt in all_cc_options if cc_options_map.get(opt, {}).get("github") != username]
+            col_cc1, col_cc2 = st.columns([1, 3])
+            with col_cc1:
+                cc_myself = st.checkbox("CC myself", value=True, key=f"team_cc_{username}")
+            with col_cc2:
+                cc_additional = st.multiselect("CC additional", options=other_cc_options, default=[], key=f"team_cc_add_{username}")
+
+            send_disabled = not token_valid or not slack_configured
+            btn_label = "📤 Send" if slack_configured else "📤 Send (No Slack ID)"
+            if st.button(btn_label, key=f"team_send_{username}", disabled=send_disabled, use_container_width=True):
+                from slack_notifier import send_slack_dm
+                success, result = send_slack_dm(token, slack_id, edited_msg)
+                if success:
+                    st.success(f"✅ Sent to {display_name}")
+                    if cc_myself and my_slack_id:
+                        cc_msg = f"[CC - sent to {display_name}]\n\n{edited_msg}"
+                        send_slack_dm(token, my_slack_id, cc_msg)
+                    for cc_name in cc_additional:
+                        cc_info = cc_options_map.get(cc_name, {})
+                        cc_slack_id = cc_info.get("slack_id", "")
+                        if cc_slack_id:
+                            cc_msg = f"[CC - sent to {display_name}]\n\n{edited_msg}"
+                            send_slack_dm(token, cc_slack_id, cc_msg)
+                else:
+                    st.error(f"Failed: {result}")
 
 select_all_users = len(selected_users) == len(all_usernames)
 
@@ -878,438 +1161,9 @@ else:
             display_closed_prs(closed_prs)
 
 st.divider()
-st.header("🔔 Slack Reminders Configuration")
+st.header("📅 Schedule Manager")
 
 slack_config = load_config()
-
-st.subheader("Reminder Thresholds")
-
-col1, col2, col3, col4 = st.columns(4)
-with col4:
-    exclude_drafts_reminders = st.checkbox(
-        "Exclude all draft PR reminders",
-        value=slack_config.get("exclude_drafts", True),
-        help="When checked, draft PRs are excluded from all reminders",
-        key="exclude_drafts_check"
-    )
-with col1:
-    hours_last_activity = st.number_input(
-        "Last activity (hours)",
-        min_value=1, max_value=168, value=slack_config.get("hours_last_activity", 24),
-        help="Remind if no activity for this many hours",
-        key="hours_last_activity"
-    )
-with col2:
-    days_draft_stale = st.number_input(
-        "Draft stale (days)",
-        min_value=1, max_value=30, value=slack_config.get("days_draft_stale", 7),
-        help="Remind if PR is draft for this many days",
-        key="days_draft_stale",
-        disabled=exclude_drafts_reminders
-    )
-with col3:
-    days_approved_not_merged = st.number_input(
-        "Approved not merged (days)",
-        min_value=1, max_value=14, value=slack_config.get("days_approved_not_merged", 1),
-        help="Remind if approved but not merged after this many days",
-        key="days_approved_not_merged"
-    )
-
-with st.expander("Configure Slack Integration", expanded=False):
-    st.markdown("""
-    **Setup Steps:**
-    1. Create a Slack App at https://api.slack.com/apps
-    2. Add Bot Token Scopes: `chat:write`, `users:read`, `im:write`
-    3. Install to workspace and copy the Bot Token
-    4. Get each user's Slack Member ID (Profile → More → Copy member ID)
-    """)
-    
-    new_token = st.text_input(
-        "Slack Bot Token",
-        value=slack_config.get("slack_bot_token", ""),
-        type="password",
-        help="Starts with xoxb-"
-    )
-    
-    my_slack_id = st.text_input(
-        "My Slack ID (for CC myself)",
-        value=slack_config.get("my_slack_id", ""),
-        help="Your own Slack Member ID to receive copies of sent messages",
-        placeholder="U0123456789"
-    )
-    
-    st.subheader("GitHub → Slack User Mapping")
-    st.caption("Enter Display Name and Slack Member ID for each GitHub user")
-    
-    user_mapping = slack_config.get("user_slack_mapping", {})
-    user_names = slack_config.get("user_display_names", {})
-    new_mapping = {}
-    new_names = {}
-    
-    for username in all_usernames:
-        col_gh, col_name, col_id = st.columns([2, 2, 2])
-        with col_gh:
-            st.text_input("GitHub", value=username, disabled=True, key=f"gh_{username}")
-        with col_name:
-            new_names[username] = st.text_input(
-                "Display Name",
-                value=user_names.get(username, ""),
-                key=f"name_{username}",
-                placeholder="First Last"
-            )
-        with col_id:
-            new_mapping[username] = st.text_input(
-                "Slack ID",
-                value=user_mapping.get(username, ""),
-                key=f"slack_{username}",
-                placeholder="U0123456789"
-            )
-    
-    st.subheader("Additional Slack Contacts (CC only)")
-    st.caption("Add people without GitHub accounts who can be CC'd on messages")
-    
-    additional_contacts = slack_config.get("additional_slack_contacts", {})
-    
-    if "new_contacts" not in st.session_state:
-        st.session_state.new_contacts = dict(additional_contacts)
-    
-    col_name, col_id, col_add = st.columns([2, 2, 1])
-    with col_name:
-        new_contact_name = st.text_input("Name", key="new_contact_name", placeholder="John Doe")
-    with col_id:
-        new_contact_id = st.text_input("Slack ID", key="new_contact_id", placeholder="U0123456789")
-    with col_add:
-        st.write("")  # spacing
-        if st.button("➕ Add", key="add_contact_btn"):
-            if new_contact_name and new_contact_id:
-                st.session_state.new_contacts[new_contact_name] = new_contact_id
-                st.rerun()
-    
-    if st.session_state.new_contacts:
-        st.write("**Current additional contacts:**")
-        contacts_to_remove = []
-        for name, slack_id in st.session_state.new_contacts.items():
-            col1, col2, col3 = st.columns([2, 2, 1])
-            with col1:
-                st.text(name)
-            with col2:
-                st.text(slack_id)
-            with col3:
-                if st.button("🗑️", key=f"remove_{name}"):
-                    contacts_to_remove.append(name)
-        for name in contacts_to_remove:
-            del st.session_state.new_contacts[name]
-            st.rerun()
-    
-    if st.button("💾 Save Slack Configuration"):
-        current_config = load_config()
-        current_config.update({
-            "slack_bot_token": new_token,
-            "my_slack_id": my_slack_id,
-            "repos": all_repos,
-            "usernames": all_usernames,
-            "user_slack_mapping": new_mapping,
-            "user_display_names": new_names,
-            "additional_slack_contacts": st.session_state.new_contacts,
-            "hours_last_activity": hours_last_activity,
-            "days_draft_stale": days_draft_stale,
-            "days_approved_not_merged": days_approved_not_merged,
-            "exclude_drafts": exclude_drafts_reminders
-        })
-        save_config(current_config)
-        st.success("Configuration saved!")
-        st.rerun()
-
-with st.expander("Preview & Send Reminders", expanded=False):
-    st.caption("Preview what messages would be sent, edit if needed, then send")
-    
-    github_slack_users = {k: v for k, v in slack_config.get("user_slack_mapping", {}).items() if v}
-    user_display_names = slack_config.get("user_display_names", {})
-    additional_contacts = st.session_state.get("new_contacts", slack_config.get("additional_slack_contacts", {}))
-    
-    cc_options_map = {}
-    for gh_user, slack_id in github_slack_users.items():
-        display = user_display_names.get(gh_user) or gh_user
-        cc_options_map[display] = {"type": "github", "github": gh_user, "slack_id": slack_id}
-    for name, slack_id in additional_contacts.items():
-        cc_options_map[f"📋 {name}"] = {"type": "additional", "slack_id": slack_id}
-    
-    all_cc_options = list(cc_options_map.keys())
-    col_cc, col_myself = st.columns([3, 1])
-    with col_cc:
-        cc_recipients = st.multiselect(
-            "CC additional recipients",
-            options=all_cc_options,
-            default=[],
-            help="These people will receive a copy of all messages sent",
-            key="cc_recipients"
-        )
-    with col_myself:
-        my_slack_id_configured = slack_config.get("my_slack_id", "")
-        cc_myself = st.checkbox(
-            "CC myself",
-            value=False,
-            disabled=not my_slack_id_configured,
-            help="Send a copy to yourself" if my_slack_id_configured else "Configure 'My Slack ID' in Slack Integration first"
-        )
-    
-    reminder_config = {
-        "hours_last_activity": hours_last_activity,
-        "days_draft_stale": days_draft_stale,
-        "days_approved_not_merged": days_approved_not_merged,
-        "exclude_drafts": exclude_drafts,
-        "exclude_cherrypicks": exclude_cherrypicks,
-        "days_back": days_back,
-        "user_display_names": slack_config.get("user_display_names", {}),
-        "user_slack_mapping": slack_config.get("user_slack_mapping", {})
-    }
-    
-    if "preview_messages" not in st.session_state:
-        st.session_state.preview_messages = {}
-    
-    selected_users = st.session_state.get("selected_users", [])
-    show_consolidated_option = len(selected_users) > 1
-    
-    if st.button("👁️ Generate Preview"):
-        st.session_state.preview_messages = {}
-        table_rows = st.session_state.get("pr_table_rows", [])
-        if not table_rows:
-            st.warning("No PR data available. Please wait for the table to load.")
-        else:
-            fresh_config = load_config()
-            awaiting_by_user = {}
-            with st.spinner("Fetching reviewer data..."):
-                awaiting_prs = search_review_requested_prs(all_repos, selected_users)
-                for username, prs in awaiting_prs.items():
-                    if prs:
-                        pr_list = []
-                        for pr in prs:
-                            owner = pr.get("_owner", "")
-                            repo = pr.get("_repo", "")
-                            if not owner or not repo:
-                                owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
-                            pr_number = pr.get("number")
-                            if owner and repo and pr_number:
-                                pr_list.append((owner, repo, pr_number))
-                        
-                        all_pr_data = get_multiple_prs_full_details(pr_list) if pr_list else {}
-                        
-                        pr_data_list = []
-                        for pr in prs:
-                            owner = pr.get("_owner", "")
-                            repo = pr.get("_repo", "")
-                            if not owner or not repo:
-                                owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
-                            pr_number = pr.get("number")
-                            
-                            pr_details = all_pr_data.get((owner, repo, pr_number), {})
-                            reviews = pr_details.get("reviews", [])
-                            
-                            user_has_reviewed = any(
-                                r.get("user", {}).get("login", "").lower() == username.lower()
-                                for r in reviews
-                            )
-                            
-                            if user_has_reviewed:
-                                continue
-                            
-                            created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")).replace(tzinfo=None)
-                            hours_waiting = (datetime.utcnow() - created_at).total_seconds() / 3600
-                            pr_data_list.append({"pr": pr, "hours_waiting": hours_waiting})
-                        
-                        if pr_data_list:
-                            awaiting_by_user[username] = pr_data_list
-            st.session_state.preview_messages = generate_preview_from_table_rows(
-                table_rows,
-                fresh_config.get("user_display_names", {}),
-                fresh_config.get("user_slack_mapping", {}),
-                consolidated=show_consolidated_option,
-                awaiting_review_by_user=awaiting_by_user
-            )
-            if not st.session_state.preview_messages:
-                st.info("No PRs need attention - no reminders to send.")
-    
-    edited_messages = {}
-    consolidated_message = None
-    if st.session_state.preview_messages:
-        has_consolidated = "__consolidated__" in st.session_state.preview_messages
-        
-        if has_consolidated:
-            tab_messages, tab_stats = st.tabs(["📝 Messages", "📊 Team Stats"])
-            
-            with tab_stats:
-                data = st.session_state.preview_messages["__consolidated__"]
-                user_stats = data.get("user_stats", [])
-                
-                exclude_drafts = st.checkbox("Exclude Draft PRs", value=False, key="exclude_drafts_stats")
-                
-                st.subheader("Team Summary")
-                with st.spinner("Fetching team metrics..."):
-                    merged_prs = search_merged_prs(all_repos, selected_users, days_back)
-                    reviewed_prs = search_reviewed_prs(all_repos, selected_users, days_back)
-                    awaiting_review = search_review_requested_prs(all_repos, selected_users)
-                    
-                    if exclude_drafts:
-                        merged_prs = [pr for pr in merged_prs if not pr.get("draft", False)]
-                        reviewed_prs = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in reviewed_prs.items()}
-                        awaiting_review = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in awaiting_review.items()}
-                    
-                    total_merged = len(merged_prs)
-                    total_reviewed = sum(len(prs) for prs in reviewed_prs.values())
-                    total_awaiting = sum(len(prs) for prs in awaiting_review.values())
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("🔀 Total PRs Merged", total_merged)
-                with col2:
-                    st.metric("👀 Total PRs Reviewed", total_reviewed)
-                with col3:
-                    st.metric("⏳ PRs Awaiting Review", total_awaiting)
-                
-                if user_stats:
-                    if exclude_drafts:
-                        filtered_stats = []
-                        for stat in user_stats:
-                            new_stat = stat.copy()
-                            new_stat["Stale Drafts"] = 0
-                            filtered_stats.append(new_stat)
-                        df_stats = pd.DataFrame(filtered_stats)
-                    else:
-                        df_stats = pd.DataFrame(user_stats)
-                    
-                    st.subheader("Attention Summary Table")
-                    html_table = df_stats.to_html(index=False, escape=False)
-                    html_table = html_table.replace('<thead>', '''<thead style="background-color: #4b5563;">''')
-                    html_table = html_table.replace('<th>', '''<th style="font-weight: 700; font-size: 15px; color: white; padding: 12px 16px; text-align: left;">''')
-                    html_table = html_table.replace('<table ', '''<table style="width: 100%; border-collapse: collapse;" ''')
-                    html_table = html_table.replace('<td>', '''<td style="padding: 10px 16px; border-bottom: 1px solid #e5e7eb;">''')
-                    st.markdown(html_table, unsafe_allow_html=True)
-                    
-                    st.subheader("PRs by Team Member")
-                    chart_data = df_stats.set_index("Name")[["Inactive", "Approved (not merged)", "Stale Drafts"]]
-                    st.bar_chart(chart_data)
-                
-                st.subheader("👤 Individual Reviewer Activity")
-                user_display_names = slack_config.get("user_display_names", {})
-                
-                reviewer_data = []
-                for username in selected_users:
-                    display_name = user_display_names.get(username, username)
-                    prs_reviewed = reviewed_prs.get(username, [])
-                    prs_awaiting = awaiting_review.get(username, [])
-                    
-                    reviewer_data.append({
-                        "Name": display_name,
-                        "PRs Reviewed": len(prs_reviewed),
-                        "Awaiting Their Review": len(prs_awaiting)
-                    })
-                
-                df_reviewer = pd.DataFrame(reviewer_data)
-                html_reviewer = df_reviewer.to_html(index=False, escape=False)
-                html_reviewer = html_reviewer.replace('<thead>', '''<thead style="background-color: #4b5563;">''')
-                html_reviewer = html_reviewer.replace('<th>', '''<th style="font-weight: 700; font-size: 15px; color: white; padding: 12px 16px; text-align: left;">''')
-                html_reviewer = html_reviewer.replace('<table ', '''<table style="width: 100%; border-collapse: collapse;" ''')
-                html_reviewer = html_reviewer.replace('<td>', '''<td style="padding: 10px 16px; border-bottom: 1px solid #e5e7eb;">''')
-                st.markdown(html_reviewer, unsafe_allow_html=True)
-                
-                st.subheader("📋 PRs Awaiting Review Details")
-                for username in selected_users:
-                    prs_awaiting = awaiting_review.get(username, [])
-                    if prs_awaiting:
-                        display_name = user_display_names.get(username, username)
-                        with st.expander(f"{display_name} ({len(prs_awaiting)} PRs awaiting review)"):
-                            for pr in prs_awaiting:
-                                title = pr.get("title", "")[:60] + ("..." if len(pr.get("title", "")) > 60 else "")
-                                pr_url = pr.get("html_url", "")
-                                author = pr.get("user", {}).get("login", "Unknown")
-                                st.markdown(f"• [{pr.get('number')}]({pr_url}) - {title} (by {author})")
-            
-            with tab_messages:
-                st.subheader("Consolidated Team Summary")
-                consolidated_message = st.text_area(
-                    "Consolidated Message",
-                    value=data["message"],
-                    height=400,
-                    key="msg_consolidated",
-                    label_visibility="collapsed"
-                )
-        else:
-            for user, data in st.session_state.preview_messages.items():
-                if data["status"] == "no_prs":
-                    st.info(f"**{user}**: No PRs need attention")
-                else:
-                    slack_id = data.get("slack_id", "NOT MAPPED")
-                    st.markdown(f"**{user}** (Slack: `{slack_id}`)")
-                    edited_messages[user] = st.text_area(
-                        f"Message for {user}",
-                        value=data["message"],
-                        height=250,
-                        key=f"msg_{user}",
-                        label_visibility="collapsed"
-                    )
-        
-        if cc_recipients and not consolidated_message:
-            st.info(f"📋 CC: {', '.join(cc_recipients)}")
-        
-        st.divider()
-        
-        if consolidated_message:
-            st.info("💡 Consolidated view is for review only. Copy the message above to share manually, or uncheck 'Consolidated view' to send individual messages.")
-        elif st.button("🚀 Send Edited Messages", type="primary"):
-            token = slack_config.get("slack_bot_token", "")
-            if not token or token == "xoxb-YOUR-BOT-TOKEN-HERE":
-                st.error("Please configure a valid Slack Bot Token first!")
-            else:
-                from slack_notifier import send_slack_dm, get_user_slack_mapping
-                user_slack_map = get_user_slack_mapping()
-                
-                sent, failed, no_slack, cc_sent, cc_failed = 0, 0, 0, 0, 0
-                for user, message in edited_messages.items():
-                    if not message.strip():
-                        continue
-                    slack_id = user_slack_map.get(user)
-                    if not slack_id or slack_id == "U_SLACK_ID_HERE":
-                        st.write(f"⚠️ {user} - No Slack ID configured")
-                        no_slack += 1
-                        continue
-                    
-                    success = send_slack_dm(slack_id, message)
-                    if success:
-                        st.write(f"✅ {user}")
-                        sent += 1
-                    else:
-                        st.write(f"❌ {user} - Failed to send")
-                        failed += 1
-                    
-                    for cc_display_name in cc_recipients:
-                        cc_info = cc_options_map.get(cc_display_name, {})
-                        if cc_info.get("type") == "github" and cc_info.get("github") == user:
-                            continue
-                        cc_slack_id = cc_info.get("slack_id")
-                        if cc_slack_id:
-                            cc_message = f"📋 *CC - Message sent to {user}:*\n\n{message}"
-                            if send_slack_dm(cc_slack_id, cc_message):
-                                cc_sent += 1
-                            else:
-                                cc_failed += 1
-                
-                if cc_myself and my_slack_id_configured:
-                    for user, message in edited_messages.items():
-                        if not message.strip():
-                            continue
-                        cc_message = f"📋 *CC - Message sent to {user}:*\n\n{message}"
-                        if send_slack_dm(my_slack_id_configured, cc_message):
-                            cc_sent += 1
-                        else:
-                            cc_failed += 1
-                
-                summary = f"Sent: {sent} | Failed: {failed} | No Slack ID: {no_slack}"
-                if cc_recipients or cc_myself:
-                    summary += f" | CC sent: {cc_sent} | CC failed: {cc_failed}"
-                st.success(summary)
-
-st.divider()
-st.header("📅 Schedule Manager")
 
 DAYS_OF_WEEK = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 FREQUENCIES = ["Daily", "Weekly", "Monthly", "Custom Interval"]
