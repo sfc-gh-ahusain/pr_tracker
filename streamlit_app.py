@@ -885,12 +885,19 @@ def display_team_stats(all_repos, selected_users, days_back, exclude_drafts=Fals
     if view_mode == "Bar Chart":
         import altair as alt
         chart_df = df_reviewer.melt(id_vars=["Name"], var_name="Metric", value_name="Count")
-        chart = alt.Chart(chart_df).mark_bar().encode(
+        bars = alt.Chart(chart_df).mark_bar().encode(
             y=alt.Y("Name:N", sort=None, title=None, axis=alt.Axis(labelFontSize=14, labelFontWeight="bold")),
             x=alt.X("Count:Q", title="PRs"),
             color=alt.Color("Metric:N", legend=alt.Legend(orient="top")),
             yOffset="Metric:N"
-        ).properties(height=max(80 * len(selected_users), 200))
+        )
+        text = alt.Chart(chart_df).mark_text(align="left", dx=4, fontSize=12, fontWeight="bold").encode(
+            y=alt.Y("Name:N", sort=None),
+            x=alt.X("Count:Q"),
+            text=alt.Text("Count:Q"),
+            yOffset="Metric:N"
+        )
+        chart = (bars + text).properties(height=max(80 * len(selected_users), 200))
         st.altair_chart(chart, use_container_width=True)
     else:
         html_reviewer = df_reviewer.to_html(index=False, escape=False)
