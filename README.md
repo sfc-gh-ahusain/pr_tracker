@@ -17,7 +17,7 @@ A Streamlit dashboard to track GitHub Pull Request activity for your team, with 
 ### 1. Navigate to project
 
 ```bash
-cd /Users/ahusain/pr-dashboard
+cd /Users/ahusain/pr_tracker
 ```
 
 ### 2. Create virtual environment (if not exists)
