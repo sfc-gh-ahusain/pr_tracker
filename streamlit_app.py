@@ -510,6 +510,9 @@ def display_individual_stats_combined(all_repos, username, days_back, exclude_dr
         
         if exclude_drafts:
             merged_prs = [pr for pr in merged_prs if not pr.get("draft", False)]
+        if exclude_cherrypicks:
+            open_prs = [pr for pr in open_prs if not is_cherrypick_pr(pr.get("title", ""))]
+            merged_prs = [pr for pr in merged_prs if not is_cherrypick_pr(pr.get("title", ""))]
         
         user_merged = [pr for pr in merged_prs if pr.get("user", {}).get("login") == username]
     
@@ -532,6 +535,8 @@ def display_individual_stats_combined(all_repos, username, days_back, exclude_dr
         prs_as_reviewer = search_prs_where_user_is_reviewer(all_repos, [username])
         if exclude_drafts:
             prs_as_reviewer = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in prs_as_reviewer.items()}
+        if exclude_cherrypicks:
+            prs_as_reviewer = {u: [pr for pr in prs if not is_cherrypick_pr(pr.get("title", ""))] for u, prs in prs_as_reviewer.items()}
         user_reviewing = prs_as_reviewer.get(username, [])
     
     if user_reviewing:
@@ -638,6 +643,10 @@ def display_individual_stats_combined(all_repos, username, days_back, exclude_dr
     
     awaiting_review = search_review_requested_prs(all_repos, [username])
     user_awaiting = awaiting_review.get(username, [])
+    if exclude_drafts:
+        user_awaiting = [pr for pr in user_awaiting if not pr.get("draft", False)]
+    if exclude_cherrypicks:
+        user_awaiting = [pr for pr in user_awaiting if not is_cherrypick_pr(pr.get("title", ""))]
     
     lines = [f"Hi {display_name}! 👋", ""]
     if open_prs:
@@ -646,7 +655,8 @@ def display_individual_stats_combined(all_repos, username, days_back, exclude_dr
             pr_num = pr.get("number", "?")
             pr_url = pr.get("html_url", "")
             title = pr.get("title", "Untitled")
-            lines.append(f"  • <{pr_url}|PR #{pr_num}>: \"{title}\"")
+            draft_label = " [Draft]" if pr.get("draft", False) else ""
+            lines.append(f"  • <{pr_url}|PR #{pr_num}>: \"{title}\"{draft_label}")
         lines.append("")
     if user_awaiting:
         lines.append(f"👀 *{len(user_awaiting)} PR(s) awaiting your review:*")
@@ -655,37 +665,41 @@ def display_individual_stats_combined(all_repos, username, days_back, exclude_dr
             pr_url = pr.get("html_url", "")
             title = pr.get("title", "Untitled")
             author = pr.get("user", {}).get("login", "Unknown")
-            lines.append(f'  • <{pr_url}|PR #{pr_num}>: "{title}" by {author}')
+            draft_label = " [Draft]" if pr.get("draft", False) else ""
+            lines.append(f'  • <{pr_url}|PR #{pr_num}>: "{title}"{draft_label} by {author}')
     lines.extend(["", "---", "Please take a moment to review these PRs. If any are stalled, we would like to understand the blockers so I can help move them forward. Is the inactivity due to:", "a) Pending reviews (stakeholders or area-experts)?", "b) Technical hurdles or shifting priorities?", "Let me know where we can step in to clear the path or nudge the right/concerned folks."])
     default_message = "\n".join(lines)
     
-    edited_msg = st.text_area("Message:", value=default_message, height=200, key=f"indiv_msg_{username}")
-    
-    other_cc_options = [opt for opt in cc_options_map.keys() if cc_options_map.get(opt, {}).get("github") != username]
-    col_cc1, col_cc2 = st.columns([1, 3])
-    with col_cc1:
-        cc_myself = st.checkbox("CC myself", value=True, key=f"indiv_cc_{username}")
-    with col_cc2:
-        cc_additional = st.multiselect("CC additional", options=other_cc_options, default=[], key=f"indiv_cc_add_{username}")
-    
-    send_disabled = not token_valid or not slack_configured
-    btn_label = "📤 Send Reminder" if slack_configured else "📤 Send (No Slack ID)"
-    if st.button(btn_label, key=f"indiv_send_{username}", disabled=send_disabled, use_container_width=True):
-        from slack_notifier import send_slack_dm
-        success, result = send_slack_dm(token, slack_id, edited_msg)
-        if success:
-            st.success(f"✅ Sent to {display_name}")
-            if cc_myself and my_slack_id:
-                cc_msg = f"[CC - sent to {display_name}]\n\n{edited_msg}"
-                send_slack_dm(token, my_slack_id, cc_msg)
-            for cc_name in cc_additional:
-                cc_info = cc_options_map.get(cc_name, {})
-                cc_slack_id = cc_info.get("slack_id", "")
-                if cc_slack_id:
+    msg_hash = hash(default_message)
+    with st.form(key=f"indiv_form_{username}_{msg_hash}"):
+        edited_msg = st.text_area("Message:", value=default_message, height=200)
+
+        other_cc_options = [opt for opt in cc_options_map.keys() if cc_options_map.get(opt, {}).get("github") != username]
+        col_cc1, col_cc2 = st.columns([1, 3])
+        with col_cc1:
+            cc_myself = st.checkbox("CC myself", value=True)
+        with col_cc2:
+            cc_additional = st.multiselect("CC additional", options=other_cc_options, default=[])
+
+        send_disabled = not token_valid or not slack_configured
+        btn_label = "📤 Send Reminder" if slack_configured else "📤 Send (No Slack ID)"
+        submitted = st.form_submit_button(btn_label, disabled=send_disabled, use_container_width=True)
+        if submitted:
+            from slack_notifier import send_slack_dm
+            success = send_slack_dm(slack_id, edited_msg)
+            if success:
+                st.success(f"✅ Sent to {display_name}")
+                if cc_myself and my_slack_id:
                     cc_msg = f"[CC - sent to {display_name}]\n\n{edited_msg}"
-                    send_slack_dm(token, cc_slack_id, cc_msg)
-        else:
-            st.error(f"Failed: {result}")
+                    send_slack_dm(my_slack_id, cc_msg)
+                for cc_name in cc_additional:
+                    cc_info = cc_options_map.get(cc_name, {})
+                    cc_slack_id = cc_info.get("slack_id", "")
+                    if cc_slack_id:
+                        cc_msg = f"[CC - sent to {display_name}]\n\n{edited_msg}"
+                        send_slack_dm(cc_slack_id, cc_msg)
+            else:
+                st.error("Failed to send message")
 
 def display_individual_stats(all_repos, username, days_back, exclude_drafts=False):
     """Display stats for a single selected user."""
@@ -835,7 +849,7 @@ def display_individual_stats(all_repos, username, days_back, exclude_drafts=Fals
         else:
             st.info(f"{display_name} is not currently listed as a reviewer on any open PRs.")
 
-def display_team_stats(all_repos, selected_users, days_back, exclude_drafts=False):
+def display_team_stats(all_repos, selected_users, days_back, exclude_drafts=False, exclude_cherrypicks=False):
     config = load_config()
     user_display_names = config.get("user_display_names", {})
     
@@ -849,6 +863,10 @@ def display_team_stats(all_repos, selected_users, days_back, exclude_drafts=Fals
             merged_prs = [pr for pr in merged_prs if not pr.get("draft", False)]
             reviewed_prs = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in reviewed_prs.items()}
             awaiting_review = {u: [pr for pr in prs if not pr.get("draft", False)] for u, prs in awaiting_review.items()}
+        if exclude_cherrypicks:
+            merged_prs = [pr for pr in merged_prs if not is_cherrypick_pr(pr.get("title", ""))]
+            reviewed_prs = {u: [pr for pr in prs if not is_cherrypick_pr(pr.get("title", ""))] for u, prs in reviewed_prs.items()}
+            awaiting_review = {u: [pr for pr in prs if not is_cherrypick_pr(pr.get("title", ""))] for u, prs in awaiting_review.items()}
         
         total_merged = len(merged_prs)
         total_reviewed = sum(len(prs) for prs in reviewed_prs.values())
@@ -931,6 +949,8 @@ def display_team_stats(all_repos, selected_users, days_back, exclude_drafts=Fals
         all_open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
         if exclude_drafts:
             all_open_prs = [pr for pr in all_open_prs if not pr.get("draft", False)]
+        if exclude_cherrypicks:
+            all_open_prs = [pr for pr in all_open_prs if not is_cherrypick_pr(pr.get("title", ""))]
         
         pr_keys = []
         for pr in all_open_prs:
@@ -950,6 +970,10 @@ def display_team_stats(all_repos, selected_users, days_back, exclude_drafts=Fals
                 owner, repo = parse_repo_from_url(pr.get("repository_url", ""))
                 pr_number = pr.get("number")
                 pr_data = all_pr_details.get((owner, repo, pr_number), {})
+                details = pr_data.get("details", {})
+                base_branch = details.get("base", {}).get("ref", "") if details else ""
+                if exclude_cherrypicks and is_cherrypick_pr(pr.get("title", ""), base_branch):
+                    continue
                 reviews = pr_data.get("reviews", [])
                 issue_comments = pr_data.get("comments", [])
                 review_comments = pr_data.get("review_comments", [])
@@ -1023,7 +1047,8 @@ def display_team_stats(all_repos, selected_users, days_back, exclude_drafts=Fals
                         pr_url = pr.get("html_url", "")
                         needs_attn = pr.get("_needs_attention", False)
                         icon = "⚠️" if needs_attn else "✓"
-                        st.markdown(f"{icon} [{pr.get('number')}]({pr_url}) - {title}")
+                        draft_tag = " `Draft`" if pr.get("draft", False) else ""
+                        st.markdown(f"{icon} [{pr.get('number')}]({pr_url}) - {title}{draft_tag}")
                 else:
                     st.caption("No open PRs")
             with col_awaiting:
@@ -1036,7 +1061,8 @@ def display_team_stats(all_repos, selected_users, days_back, exclude_drafts=Fals
                         author = pr.get("user", {}).get("login", "Unknown")
                         needs_attn = pr.get("_needs_attention", False)
                         icon = "⚠️" if needs_attn else "✓"
-                        st.markdown(f"{icon} [{pr.get('number')}]({pr_url}) - {title} (by {author})")
+                        draft_tag = " `Draft`" if pr.get("draft", False) else ""
+                        st.markdown(f"{icon} [{pr.get('number')}]({pr_url}) - {title} (by {author}){draft_tag}")
                 else:
                     st.caption("No PRs awaiting review")
 
@@ -1052,7 +1078,8 @@ def display_team_stats(all_repos, selected_users, days_back, exclude_drafts=Fals
                     title = pr.get("title", "Untitled")
                     hours = pr.get("_hours_inactive", 0)
                     time_str = f"{hours // 24}d {hours % 24}h" if hours >= 24 else f"{hours}h"
-                    lines.append(f"  • <{pr_url}|PR #{pr_num}>: \"{title}\" ({time_str} inactive)")
+                    draft_label = " [Draft]" if pr.get("draft", False) else ""
+                    lines.append(f"  • <{pr_url}|PR #{pr_num}>: \"{title}\"{draft_label} ({time_str} inactive)")
                 lines.append("")
             if user_awaiting:
                 lines.append(f"👀 *{len(user_awaiting)} PR(s) awaiting your review:*")
@@ -1061,39 +1088,43 @@ def display_team_stats(all_repos, selected_users, days_back, exclude_drafts=Fals
                     pr_url = pr.get("html_url", "")
                     title = pr.get("title", "Untitled")
                     author = pr.get("user", {}).get("login", "Unknown")
-                    lines.append(f'  • <{pr_url}|PR #{pr_num}>: "{title}" by {author}')
+                    draft_label = " [Draft]" if pr.get("draft", False) else ""
+                    lines.append(f'  • <{pr_url}|PR #{pr_num}>: "{title}"{draft_label} by {author}')
             if not user_attention_prs and not user_awaiting:
                 lines.append("✅ No PRs currently need your attention. Great work!")
             lines.extend(["", "---", "Please take a moment to review these PRs. If any are stalled, we would like to understand the blockers so I can help move them forward. Is the inactivity due to:", "a) Pending reviews (stakeholders or area-experts)?", "b) Technical hurdles or shifting priorities?", "Let me know where we can step in to clear the path or nudge the right/concerned folks."])
             default_message = "\n".join(lines)
 
-            edited_msg = st.text_area("Message:", value=default_message, height=200, key=f"team_msg_{username}")
+            msg_hash = hash(default_message)
+            with st.form(key=f"team_form_{username}_{msg_hash}"):
+                edited_msg = st.text_area("Message:", value=default_message, height=200)
 
-            other_cc_options = [opt for opt in all_cc_options if cc_options_map.get(opt, {}).get("github") != username]
-            col_cc1, col_cc2 = st.columns([1, 3])
-            with col_cc1:
-                cc_myself = st.checkbox("CC myself", value=True, key=f"team_cc_{username}")
-            with col_cc2:
-                cc_additional = st.multiselect("CC additional", options=other_cc_options, default=[], key=f"team_cc_add_{username}")
+                other_cc_options = [opt for opt in all_cc_options if cc_options_map.get(opt, {}).get("github") != username]
+                col_cc1, col_cc2 = st.columns([1, 3])
+                with col_cc1:
+                    cc_myself = st.checkbox("CC myself", value=True)
+                with col_cc2:
+                    cc_additional = st.multiselect("CC additional", options=other_cc_options, default=[])
 
-            send_disabled = not token_valid or not slack_configured
-            btn_label = "📤 Send" if slack_configured else "📤 Send (No Slack ID)"
-            if st.button(btn_label, key=f"team_send_{username}", disabled=send_disabled, use_container_width=True):
-                from slack_notifier import send_slack_dm
-                success, result = send_slack_dm(token, slack_id, edited_msg)
-                if success:
-                    st.success(f"✅ Sent to {display_name}")
-                    if cc_myself and my_slack_id:
-                        cc_msg = f"[CC - sent to {display_name}]\n\n{edited_msg}"
-                        send_slack_dm(token, my_slack_id, cc_msg)
-                    for cc_name in cc_additional:
-                        cc_info = cc_options_map.get(cc_name, {})
-                        cc_slack_id = cc_info.get("slack_id", "")
-                        if cc_slack_id:
+                send_disabled = not token_valid or not slack_configured
+                btn_label = "📤 Send" if slack_configured else "📤 Send (No Slack ID)"
+                submitted = st.form_submit_button(btn_label, disabled=send_disabled, use_container_width=True)
+                if submitted:
+                    from slack_notifier import send_slack_dm
+                    success = send_slack_dm(slack_id, edited_msg)
+                    if success:
+                        st.success(f"✅ Sent to {display_name}")
+                        if cc_myself and my_slack_id:
                             cc_msg = f"[CC - sent to {display_name}]\n\n{edited_msg}"
-                            send_slack_dm(token, cc_slack_id, cc_msg)
-                else:
-                    st.error(f"Failed: {result}")
+                            send_slack_dm(my_slack_id, cc_msg)
+                        for cc_name in cc_additional:
+                            cc_info = cc_options_map.get(cc_name, {})
+                            cc_slack_id = cc_info.get("slack_id", "")
+                            if cc_slack_id:
+                                cc_msg = f"[CC - sent to {display_name}]\n\n{edited_msg}"
+                                send_slack_dm(cc_slack_id, cc_msg)
+                    else:
+                        st.error("Failed to send message")
 
 select_all_users = len(selected_users) == len(all_usernames)
 
@@ -1105,7 +1136,7 @@ if pr_state == "Open":
                 open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
             display_open_prs(open_prs, exclude_cherrypicks, exclude_drafts)
         with tab_stats:
-            display_team_stats(all_repos, selected_users, days_back, exclude_drafts)
+            display_team_stats(all_repos, selected_users, days_back, exclude_drafts, exclude_cherrypicks)
     elif len(selected_users) == 1:
         display_individual_stats_combined(all_repos, selected_users[0], days_back, exclude_drafts, exclude_cherrypicks)
     else:
@@ -1115,7 +1146,7 @@ if pr_state == "Open":
                 open_prs = search_prs(all_repos, selected_users, state="open", days_back=days_back)
             display_open_prs(open_prs, exclude_cherrypicks, exclude_drafts)
         with tab_stats:
-            display_team_stats(all_repos, selected_users, days_back, exclude_drafts)
+            display_team_stats(all_repos, selected_users, days_back, exclude_drafts, exclude_cherrypicks)
 
 elif pr_state == "Closed":
     st.subheader("🔴 Closed Pull Requests")
@@ -1133,7 +1164,7 @@ else:
             display_open_prs(open_prs, exclude_cherrypicks, exclude_drafts)
         
         with tab_stats:
-            display_team_stats(all_repos, selected_users, days_back, exclude_drafts)
+            display_team_stats(all_repos, selected_users, days_back, exclude_drafts, exclude_cherrypicks)
         
         with tab_closed:
             with st.spinner("Fetching closed PRs..."):
@@ -1160,7 +1191,7 @@ else:
             display_open_prs(open_prs, exclude_cherrypicks, exclude_drafts)
         
         with tab_stats:
-            display_team_stats(all_repos, selected_users, days_back, exclude_drafts)
+            display_team_stats(all_repos, selected_users, days_back, exclude_drafts, exclude_cherrypicks)
         
         with tab_closed:
             with st.spinner("Fetching closed PRs..."):
