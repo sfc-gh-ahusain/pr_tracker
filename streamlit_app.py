@@ -127,6 +127,27 @@ with st.sidebar:
         st.session_state.last_exclude_drafts = exclude_drafts
         st.session_state.preview_messages = {}
     
+    st.divider()
+    st.subheader("🔑 GitHub Token")
+    current_token = os.getenv("GITHUB_TOKEN", "") or saved_config.get("github_token", "")
+    masked_token = f"{current_token[:8]}...{current_token[-4:]}" if len(current_token) > 12 else ""
+    if masked_token:
+        st.caption(f"Current: `{masked_token}`")
+    else:
+        st.warning("No GitHub token configured", icon="⚠️")
+    new_token = st.text_input("GitHub Token", type="password", placeholder="ghp_... or github_pat_...")
+    if st.button("💾 Save Token"):
+        if new_token.strip():
+            os.environ["GITHUB_TOKEN"] = new_token.strip()
+            current_config = load_config()
+            current_config["github_token"] = new_token.strip()
+            save_config(current_config)
+            st.cache_data.clear()
+            st.success("Token saved!")
+            st.rerun()
+        else:
+            st.error("Token cannot be empty")
+
     if st.button("🔄 Refresh Data", type="primary"):
         st.cache_data.clear()
 
@@ -228,7 +249,8 @@ def generate_preview_from_table_rows(rows, user_display_names, user_slack_mappin
                 title = pr.get("title", "")[:50]
                 author = pr.get("user", {}).get("login", "unknown")
                 hours = pr_data.get("hours_waiting", 0)
-                sla = "🔴" if hours >= inactive_awaiting_review_hours else "🟢"
+                is_draft = pr.get("draft", False)
+                sla = "🔴" if (not is_draft) and hours >= inactive_awaiting_review_hours else "🟢"
                 time_str = f"{int(hours // 24)}d {int(hours % 24)}h" if hours >= inactive_awaiting_review_hours else f"{int(hours)}h"
                 lines.append(f'  • {sla} <{pr_url}|PR #{pr_num}>: "{title}" by {author} - {time_str}')
         
@@ -578,9 +600,10 @@ def display_individual_stats_combined(all_repos, username, days_back, exclude_dr
                 for r in reviews
             )
             
+            is_draft = pr.get("draft", False)
             if user_has_reviewed:
                 review_status = "✅ Reviewed"
-            elif hours_since_activity > review_sla_hours:
+            elif not is_draft and hours_since_activity > review_sla_hours:
                 review_status = "🔴 Needs Review"
             else:
                 review_status = "🟡 Pending"
@@ -808,9 +831,10 @@ def display_individual_stats(all_repos, username, days_back, exclude_drafts=Fals
                     for r in reviews
                 )
                 
+                is_draft = pr.get("draft", False)
                 if user_has_reviewed:
                     sla_status = "✅ Reviewed"
-                elif hours_since_activity > review_sla_hours:
+                elif not is_draft and hours_since_activity > review_sla_hours:
                     sla_status = "🔴 SLA Violation"
                 else:
                     sla_status = "🟢 On Track"
@@ -1020,7 +1044,8 @@ def display_team_stats(all_repos, selected_users, days_back, exclude_drafts=Fals
                 last_activity_dt = last_activity.replace(tzinfo=None) if last_activity else created_at.replace(tzinfo=None)
                 hours_inactive = int((now - last_activity_dt).total_seconds() / 3600)
                 
-                needs_attention = hours_inactive >= inactive_open_prs_hours
+                is_draft = pr.get("draft", False)
+                needs_attention = (not is_draft) and (hours_inactive >= inactive_open_prs_hours)
                 pr["_needs_attention"] = needs_attention
                 pr["_hours_inactive"] = hours_inactive
                 if needs_attention:

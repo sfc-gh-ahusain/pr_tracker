@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,12 +8,23 @@ import streamlit as st
 
 GITHUB_API_BASE = "https://api.github.com"
 MAX_WORKERS = 10
+SEARCH_MAX_WORKERS = 3
 
 def get_headers():
     token = os.getenv("GITHUB_TOKEN", "")
     if not token:
         try:
             token = st.secrets.get("GITHUB_TOKEN", "")
+        except Exception:
+            token = ""
+    if not token:
+        try:
+            import json
+            config_path = os.path.join(os.path.dirname(__file__), "slack_config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                token = config.get("github_token", "")
         except Exception:
             token = ""
     headers = {"Accept": "application/vnd.github.v3+json"}
@@ -27,6 +39,7 @@ def search_prs(repos: list[str], usernames: list[str], state: str = "open", days
     repos_lower = [r.lower() for r in repos]
     
     def fetch_user_prs(username):
+        time.sleep(0.5)
         user_prs = []
         query = f"is:pr author:{username} state:{state} created:>={since_date}"
         url = f"{GITHUB_API_BASE}/search/issues"
@@ -49,7 +62,7 @@ def search_prs(repos: list[str], usernames: list[str], state: str = "open", days
             return (username, [], str(e), 0, 0)
         return (username, user_prs, None, 0, 0)
     
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=SEARCH_MAX_WORKERS) as executor:
         futures = {executor.submit(fetch_user_prs, u): u for u in usernames}
         for future in as_completed(futures):
             result = future.result()
@@ -203,6 +216,7 @@ def search_merged_prs(repos: list[str], usernames: list[str], days_back: int = 9
     repos_lower = [r.lower() for r in repos]
     
     def fetch_user_merged_prs(username):
+        time.sleep(0.5)
         user_prs = []
         query = f"is:pr author:{username} is:merged merged:>={since_date}"
         url = f"{GITHUB_API_BASE}/search/issues"
@@ -220,7 +234,7 @@ def search_merged_prs(repos: list[str], usernames: list[str], days_back: int = 9
             pass
         return (username, user_prs)
     
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=SEARCH_MAX_WORKERS) as executor:
         futures = {executor.submit(fetch_user_merged_prs, u): u for u in usernames}
         for future in as_completed(futures):
             username, user_prs = future.result()
