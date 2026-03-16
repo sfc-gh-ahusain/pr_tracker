@@ -397,6 +397,9 @@ def display_open_prs(prs, exclude_cherrypicks=False, exclude_drafts=False):
         created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
         
         is_draft = pr.get("draft", False)
+        has_changes_requested = any(
+            r.get("state") == "CHANGES_REQUESTED" for r in reviews
+        )
         
         last_activity_dt = last_activity.replace(tzinfo=None) if last_activity else created_at.replace(tzinfo=None)
         hours_inactive = int((now - last_activity_dt).total_seconds() / 3600)
@@ -404,7 +407,7 @@ def display_open_prs(prs, exclude_cherrypicks=False, exclude_drafts=False):
         attention_reasons = []
         if hours_inactive >= inactive_open_prs_hours:
             attention_reasons.append(f"⏰ {hours_inactive}h inactive")
-        if first_approval and (now - first_approval.replace(tzinfo=None)).days >= 1:
+        if first_approval and not has_changes_requested and (now - first_approval.replace(tzinfo=None)).days >= 1:
             attention_reasons.append("✅ Approved, not merged")
         if is_draft and (now - created_at.replace(tzinfo=None)).days >= 7:
             attention_reasons.append("📝 Stale draft")
@@ -418,6 +421,7 @@ def display_open_prs(prs, exclude_cherrypicks=False, exclude_drafts=False):
             "Title": pr_title,
             "Base": base_branch,
             "Draft": "📝" if is_draft else "",
+            "Requested Change": "🔄" if has_changes_requested else "",
             "Submit Time": created_at.strftime("%Y-%m-%d %H:%M"),
             "Last Activity": last_activity_dt.strftime("%Y-%m-%d %H:%M") if last_activity else "—",
             "First Approval": first_approval.strftime("%Y-%m-%d %H:%M") if first_approval else "—",
