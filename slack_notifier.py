@@ -151,6 +151,27 @@ def get_user_display_names():
     config = load_config()
     return config.get("user_display_names", {})
 
+SLACK_MAX_MESSAGE_LENGTH = 3800
+
+def _split_message(message: str, max_len: int = SLACK_MAX_MESSAGE_LENGTH) -> list:
+    if len(message) <= max_len:
+        return [message]
+    chunks = []
+    lines = message.split("\n")
+    current = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + 1
+        if current_len + line_len > max_len and current:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
 def send_slack_dm(slack_user_id: str, message: str) -> bool:
     token = get_slack_token()
     if not token:
@@ -174,19 +195,20 @@ def send_slack_dm(slack_user_id: str, message: str) -> bool:
     
     channel_id = open_resp.json()["channel"]["id"]
     
-    msg_resp = requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers=headers,
-        json={
-            "channel": channel_id,
-            "text": message,
-            "mrkdwn": True
-        }
-    )
-    
-    if not msg_resp.ok or not msg_resp.json().get("ok"):
-        print(f"Error sending message: {msg_resp.text}")
-        return False
+    chunks = _split_message(message)
+    for chunk in chunks:
+        msg_resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers=headers,
+            json={
+                "channel": channel_id,
+                "text": chunk,
+                "mrkdwn": True
+            }
+        )
+        if not msg_resp.ok or not msg_resp.json().get("ok"):
+            print(f"Error sending message: {msg_resp.text}")
+            return False
     
     return True
 
