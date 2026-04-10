@@ -567,6 +567,7 @@ def display_individual_stats_combined(all_repos, username, days_back, exclude_dr
     
     if user_reviewing:
         rows = []
+        unreviewed_prs = []
         now = datetime.utcnow()
         review_sla_hours = inactive_awaiting_review_hours
         
@@ -611,6 +612,9 @@ def display_individual_stats_combined(all_repos, username, days_back, exclude_dr
                 review_status = "🔴 Needs Review"
             else:
                 review_status = "🟡 Pending"
+            
+            if not user_has_reviewed:
+                unreviewed_prs.append(pr)
             
             pr_title = pr.get("title", "")
             pr_url = pr.get("html_url", "")
@@ -668,13 +672,8 @@ def display_individual_stats_combined(all_repos, username, days_back, exclude_dr
     for name, sid in additional_contacts.items():
         cc_options_map[f"📋 {name}"] = {"type": "additional", "slack_id": sid}
     
-    awaiting_review = search_review_requested_prs(all_repos, [username])
-    user_awaiting = awaiting_review.get(username, [])
-    if exclude_drafts:
-        user_awaiting = [pr for pr in user_awaiting if not pr.get("draft", False)]
-    if exclude_cherrypicks:
-        user_awaiting = [pr for pr in user_awaiting if not is_cherrypick_pr(pr.get("title", ""))]
-    
+    user_awaiting = unreviewed_prs if user_reviewing else []
+
     lines = [f"Hi {display_name}! 👋", ""]
     if open_prs:
         lines.append(f"📂 *You have {len(open_prs)} open PR(s):*")
